@@ -1,0 +1,230 @@
+{
+  "log": {
+    "disabled": true,
+    "level": "warn",
+    "timestamp": true
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "store_rdrc": true
+    }
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-proxy",
+        "type": "https",
+        "server": "8.8.8.8",
+        "detour": "out-socks"
+      },
+      {
+        "tag": "dns-direct",
+        "type": "https",
+        "server": "dns.alidns.com",
+        "domain_resolver": "dns-ali"
+      },
+      {
+        "tag": "dns-ali",
+        "type": "udp",
+        "server": "223.5.5.5"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": ["geosite-category-ads-all"],
+        "server": "dns-direct",
+        "action": "reject",
+        "method": "default",
+        "no_drop": false
+      },
+      {
+        "domain": [
+          "cf.godns.cc",
+          "cf.tencentapp.cn",
+          "cfyx.tencentapp.cn",
+          "1749991941.bilibiliapp.cn",
+          "freeyx.cloudflare88.eu.org",
+          "cfcn-a-proctusa.chinabaidu.pp.ua",
+          "dnew.cc",
+          "cloudflare.182682.xyz",
+          "baota.me",
+          "cloudflare-ip.mofashi.ltd"
+        ],
+        "server": "dns-direct"
+      },
+      {
+        "rule_set": ["geosite-category-games@cn"],
+        "server": "dns-direct"
+      },
+      {
+        "rule_set": ["geosite-geolocation-!cn"],
+        "server": "dns-proxy"
+      },
+      {
+        "rule_set": ["geosite-cn"],
+        "server": "dns-direct"
+      }
+    ],
+    "final": "dns-proxy",
+    "strategy": "prefer_ipv4",
+    "disable_cache": false,
+    "disable_expire": false,
+    "independent_cache": true,
+    "reverse_mapping": false
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "in-tun",
+      "interface_name": "c54747",
+      "address": ["172.18.0.1/30", "fdfe:dcba:9876::1/126"],
+      "auto_route": true,
+      "strict_route": true,
+      "endpoint_independent_nat": false,
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "out-socks",
+      "type": "socks",
+      "server": "127.0.0.1",
+      "server_port": 10808,
+      "udp_over_tcp": false
+    },
+    {
+      "tag": "out-direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": {
+      "server": "dns-direct"
+    },
+    "auto_detect_interface": true,
+    "final": "out-socks",
+    "rules": [
+      {
+        "process_name": ["xray", "xray.exe"],
+        "outbound": "out-direct"
+      },
+      {
+        "inbound": "in-tun",
+        "action": "sniff"
+      },
+      {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "protocol": "dns"
+          },
+          {
+            "port": 53
+          }
+        ],
+        "action": "hijack-dns"
+      },
+      {
+        "rule_set": "geosite-private",
+        "outbound": "out-direct"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "out-direct"
+      },
+      {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "port": 853
+          },
+          {
+            "network": "udp",
+            "port": 443
+          },
+          {
+            "protocol": "stun"
+          }
+        ],
+        "action": "reject"
+      },
+      {
+        "rule_set": "geosite-category-ads-all",
+        "action": "reject"
+      },
+      {
+        "protocol": "bittorrent",
+        "outbound": "out-direct"
+      },
+      {
+        "rule_set": "geosite-category-games@cn",
+        "outbound": "out-direct"
+      },
+      {
+        "rule_set": "geosite-geolocation-!cn",
+        "outbound": "out-socks"
+      },
+      {
+        "rule_set": "geosite-cn",
+        "outbound": "out-direct"
+      },
+      {
+        "rule_set": "geoip-cn",
+        "outbound": "out-direct"
+      }
+    ],
+    "rule_set": [
+      {
+        "tag": "geosite-private",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://gh-proxy.org/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geosite/private.srs",
+        "download_detour": "out-direct",
+        "update_interval": "3d"
+      },
+      {
+        "tag": "geosite-category-ads-all",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://gh-proxy.org/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geosite/category-ads-all.srs",
+        "download_detour": "out-direct",
+        "update_interval": "3d"
+      },
+      {
+        "tag": "geosite-category-games@cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://gh-proxy.org/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geosite/category-games@cn.srs",
+        "download_detour": "out-direct",
+        "update_interval": "3d"
+      },
+      {
+        "tag": "geosite-geolocation-!cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://gh-proxy.org/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geosite/geolocation-!cn.srs",
+        "download_detour": "out-direct",
+        "update_interval": "3d"
+      },
+      {
+        "tag": "geosite-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://gh-proxy.org/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geosite/cn.srs",
+        "download_detour": "out-direct",
+        "update_interval": "3d"
+      },
+      {
+        "tag": "geoip-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://gh-proxy.org/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geoip/cn.srs",
+        "download_detour": "out-direct",
+        "update_interval": "3d"
+      }
+    ]
+  }
+}

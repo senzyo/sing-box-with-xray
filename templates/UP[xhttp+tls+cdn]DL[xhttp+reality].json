@@ -1,0 +1,90 @@
+{
+  "log": {
+    "access": "none",
+    "error": "C:\\Users\\admin\\Apps\\sing-box-with-xray\\error.log",
+    "loglevel": "none",
+    "dnsLog": true,
+    "maskAddress": ""
+  },
+  "inbounds": [
+    {
+      "tag": "in-socks",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "mixed",
+      "settings": {
+        "auth": "noauth",
+        "udp": true,
+        "allowTransparent": false
+      },
+      "sniffing": {
+        "enabled": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "out-proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "<Cloudflare_1>",
+            "port": 443,
+            "users": [
+              {
+                "id": "<XHTTP_UUID>",
+                "flow": "",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "<XHTTP_CDN_Site>",
+          "fingerprint": "chrome",
+          "alpn": ["h2"],
+          "show": false
+        },
+        "xhttpSettings": {
+          "mode": "auto",
+          "host": "<XHTTP_CDN_Site>",
+          "path": "/<XHTTP_PATH>",
+          "extra": {
+            "downloadSettings": {
+              "address": "<VPS_IPv4>",
+              "port": 443,
+              "network": "xhttp",
+              "security": "reality",
+              "realitySettings": {
+                "serverName": "<Reality_Site>",
+                "fingerprint": "chrome",
+                "password": "<Reality_publicKey>",
+                "shortId": "<Reality_shortId>",
+                "spiderX": "/",
+                "show": false
+              },
+              "xhttpSettings": {
+                "mode": "auto",
+                "host": "",
+                "path": "/<XHTTP_PATH>"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": "in-socks",
+        "outboundTag": "out-proxy"
+      }
+    ]
+  }
+}
