@@ -10,15 +10,15 @@ foreach ($P in $Process) {
 Clear-DnsClientCache
 Start-Sleep -Seconds 1
 
-$workDir = "$env:USERPROFILE\Apps\sing-box-with-xray"
-$configPath = "$workDir\sing-box.json"
-$tempPath = "$workDir\sing-box.json.temp"
-$randomHex = -join (1..3 | ForEach-Object { "{0:x2}" -f (Get-Random -Min 0 -Max 256) })
-if (Test-Path $configPath) {
-    $jsonResult = & $workDir\jq.exe --arg new_name "$randomHex" '(.inbounds[] | select(.type == \"tun\") | .interface_name) = $new_name' $configPath 2>$null
-    if ($LASTEXITCODE -eq 0 -and $jsonResult) {
-        [System.IO.File]::WriteAllLines($tempPath, $jsonResult)
-        Move-Item -Path $tempPath -Destination $configPath -Force
+$WorkDir = "$env:USERPROFILE\Apps\sing-box-with-xray"
+$ConfigPath = "$WorkDir\sing-box.json"
+$TempPath = "$WorkDir\sing-box.json.temp"
+$RandomHex = -join (1..3 | ForEach-Object { "{0:x2}" -f (Get-Random -Min 0 -Max 256) })
+if (Test-Path $ConfigPath) {
+    $JsonResult = & $WorkDir\jq.exe --arg new_name "$RandomHex" '(.inbounds[] | select(.type == \"tun\") | .interface_name) = $new_name' $ConfigPath 2>$null
+    if ($LASTEXITCODE -eq 0 -and $JsonResult) {
+        [System.IO.File]::WriteAllLines($TempPath, $JsonResult)
+        Move-Item -Path $TempPath -Destination $ConfigPath -Force
         Write-Host "Success: TUN interface name randomized." -ForegroundColor Green
     } else {
         Write-Host "Error: TUN interface name randomization failed." -ForegroundColor Red
@@ -26,15 +26,15 @@ if (Test-Path $configPath) {
         exit
     }
 } else {
-    Write-Host "Error: File not found at $configPath" -ForegroundColor Red
+    Write-Host "Error: File not found at $ConfigPath" -ForegroundColor Red
     pause
     exit
 }
 
 Write-Host "Start sing-box and xray..." -ForegroundColor Cyan
-Start-Process -FilePath "$workDir\sing-box.exe" -ArgumentList "run -D $workDir -c $workDir\sing-box.json" -WindowStyle Hidden
+Start-Process -FilePath "$WorkDir\sing-box.exe" -ArgumentList "run -D $WorkDir -c $WorkDir\sing-box.json" -WindowStyle Hidden
 Start-Sleep -Seconds 1
-Start-Process -FilePath "$workDir\xray.exe" -ArgumentList "run -c $workDir\xray.json" -WindowStyle Hidden
+Start-Process -FilePath "$WorkDir\xray.exe" -ArgumentList "run -c $WorkDir\xray.json" -WindowStyle Hidden
 Start-Sleep -Seconds 1
 Get-Process -Name sing-box,xray
 Start-Sleep -Seconds 1
