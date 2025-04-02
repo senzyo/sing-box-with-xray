@@ -14,9 +14,9 @@ Start-Sleep -Seconds 1
 # ---- 公共函数 ----
 # 校验 Hash
 function VerifyHash {
-    $Digest = $Response.assets | Where-Object { $_.name -eq "$FileName.zip" } | Select-Object -ExpandProperty digest
+    $Digest = $Response.assets | Where-Object { $_.name -eq "$FileName" } | Select-Object -ExpandProperty digest
     $RemoteHash = $Digest.Split(':')[-1]
-    $LocalHash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash.ToLower()
+    $LocalHash = (Get-FileHash $FilePath -Algorithm SHA256).Hash.ToLower()
     Write-Host "Verifying SHA256 checksum... " -NoNewline
     if ($RemoteHash -eq $LocalHash) {
         Write-Host "Correct!" -ForegroundColor Green
@@ -29,13 +29,13 @@ function VerifyHash {
 
 # 升级
 function Upgrade {
-    $Url = $Response.assets | Where-Object { $_.name -eq "$FileName.zip" } | Select-Object -ExpandProperty browser_download_url
+    $Url = $Response.assets | Where-Object { $_.name -eq "$FileName" } | Select-Object -ExpandProperty browser_download_url
     do {
-        if (Test-Path -Path $ZipPath) {
-            Remove-Item $ZipPath -Force
+        if (Test-Path -Path $FilePath) {
+            Remove-Item -Force $FilePath
         }
         Write-Host "Downloading..."
-        Invoke-WebRequest -OutFile $ZipPath -Uri "https://gh-proxy.org/$Url"
+        Invoke-WebRequest -OutFile $FilePath -Uri "https://gh-proxy.org/$Url"
         $Correct = VerifyHash
         if ($Correct) {
             $script:Cover = $true
@@ -47,11 +47,12 @@ function Upgrade {
 }
 
 # 检查更新
-function CheckUpdate ($ExeName) {
+function CheckUpdate ($ExeName, $VersionArg) {
     $LocalVersionStr = "0.0.0"
     if (Test-Path -Path $ExePath) {
-        $VersionOutput = (& $ExePath version) 2>&1
-        if ($VersionOutput[0] -match "([\d.]+)") {
+        $VersionOutput = (& $ExePath $VersionArg) 2>&1
+        $VersionText = $VersionOutput -join " "
+        if ($VersionText -match "([\d.]+)") {
             $LocalVersionStr = $Matches[1]
         }
     }
@@ -69,43 +70,63 @@ function CheckUpdate ($ExeName) {
 }
 # ---- 公共函数 结束 ----
 
-$OutDir = "$env:USERPROFILE\Apps\sing-box-with-xray"
+$WorkDir = "$env:USERPROFILE\Apps\sing-box-with-xray"
 
 # ---- 更新 sing-box ----
-$ExePath = "$OutDir\sing-box.exe"
+$ExePath = "$WorkDir\sing-box.exe"
 $Response = Invoke-RestMethod -Uri "https://api.github.com/repos/SagerNet/sing-box/releases/latest" -Method Get
 $TagName = $Response.tag_name
 $RemoteVersionStr = $TagName.TrimStart('v')
-$FileName = "sing-box-$RemoteVersionStr-windows-amd64"
-$ZipPath = "$OutDir\$FileName.zip"
+$FileName = "sing-box-$RemoteVersionStr-windows-amd64.zip"
+$FilePath = "$WorkDir\$FileName"
+$Folder = $FileName -replace '\.zip$', ''
 
-CheckUpdate sing-box
+$script:Cover = $false
+CheckUpdate 'sing-box' 'version'
 
 # 解压缩并覆盖 sing-box
 if ($script:Cover) {
-    Expand-Archive -Path $ZipPath -DestinationPath $OutDir -Force
-    Move-Item -Path "$OutDir\$FileName\sing-box.exe" -Destination "$OutDir\sing-box.exe" -Force
-    Remove-Item -Recurse "$OutDir\$FileName*" -Force
+    Expand-Archive -Path $FilePath -DestinationPath $WorkDir -Force
+    Move-Item -Path "$WorkDir\$Folder\sing-box.exe" -Destination "$ExePath" -Force
+    Remove-Item -Force -Recurse "$WorkDir\$Folder","$FilePath"
 }
 # ---- 更新 sing-box 结束 ----
 
 # ---- 更新 xray ----
-$ExePath = "$OutDir\xray.exe"
+$ExePath = "$WorkDir\xray.exe"
 $Response = Invoke-RestMethod -Uri "https://api.github.com/repos/XTLS/Xray-core/releases/latest" -Method Get
 $TagName = $Response.tag_name
 $RemoteVersionStr = $TagName.TrimStart('v')
-$FileName = "Xray-windows-64"
-$ZipPath = "$OutDir\$FileName.zip"
-$script:Cover = $false
+$FileName = "Xray-windows-64.zip"
+$FilePath = "$WorkDir\$FileName"
+$Folder = $FileName -replace '\.zip$', ''
 
-CheckUpdate xray
+$script:Cover = $false
+CheckUpdate 'xray' 'version'
 
 # 解压缩并覆盖 xray
 if ($script:Cover) {
-    Expand-Archive -Path $ZipPath -DestinationPath "$OutDir\$FileName" -Force
-    Move-Item -Path "$OutDir\$FileName\xray.exe" -Destination "$OutDir\xray.exe" -Force
-    Remove-Item -Recurse "$OutDir\$FileName*" -Force
+    Expand-Archive -Path $FilePath -DestinationPath "$WorkDir\$Folder" -Force
+    Move-Item -Path "$WorkDir\$Folder\xray.exe" -Destination "$ExePath" -Force
+    Remove-Item -Force -Recurse "$WorkDir\$Folder","$FilePath"
 }
 # ---- 更新 xray 结束 ----
+
+# ---- 更新 jq ----
+$ExePath = "$WorkDir\jq.exe"
+$Response = Invoke-RestMethod -Uri "https://api.github.com/repos/jqlang/jq/releases/latest" -Method Get
+$TagName = $Response.tag_name
+$RemoteVersionStr = $TagName.TrimStart('jq-')
+$FileName = "jq-windows-amd64.exe"
+$FilePath = "$WorkDir\$FileName"
+
+$script:Cover = $false
+CheckUpdate 'jq' '--version'
+
+# 覆盖 jq
+if ($script:Cover) {
+    Move-Item -Path "$FilePath" -Destination "$ExePath" -Force
+}
+# ---- 更新 jq 结束 ----
 
 pause

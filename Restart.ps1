@@ -15,7 +15,7 @@ $configPath = "$workDir\sing-box.json"
 $tempPath = "$workDir\sing-box.json.temp"
 $randomHex = -join (1..3 | ForEach-Object { "{0:x2}" -f (Get-Random -Min 0 -Max 256) })
 if (Test-Path $configPath) {
-    $jsonResult = & jq --arg new_name "$randomHex" '(.inbounds[] | select(.type == \"tun\") | .interface_name) = $new_name' $configPath 2>$null
+    $jsonResult = & $workDir\jq.exe --arg new_name "$randomHex" '(.inbounds[] | select(.type == \"tun\") | .interface_name) = $new_name' $configPath 2>$null
     if ($LASTEXITCODE -eq 0 -and $jsonResult) {
         [System.IO.File]::WriteAllLines($tempPath, $jsonResult)
         Move-Item -Path $tempPath -Destination $configPath -Force
