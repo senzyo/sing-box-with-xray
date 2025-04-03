@@ -1,11 +1,29 @@
-# 停止运行 sing-box 和 xray
+$ESC = [char]27
+$Black = "$ESC[90m"
+$Red = "$ESC[91m"       # [Error]
+$Green = "$ESC[92m"     # [Success]
+$Yellow = "$ESC[93m"    # [Warning]
+$Blue = "$ESC[94m"
+$Magenta = "$ESC[95m"
+$Cyan = "$ESC[96m"      # [Notice]
+$White = "$ESC[97m"
+$NC = "$ESC[0m"         # No Color
+
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Host "${Red}[Error]${NC} Please run this script as Administrator."
+    exit 1
+}
+
 $Process = @("sing-box", "xray")
 foreach ($P in $Process) {
     if (Get-Process $P -ErrorAction SilentlyContinue) {
         Stop-Process -Name $P -Force
-        Write-Host "$P has stopped." -ForegroundColor Green
+        Write-Host "${Green}[Success]${NC} $P has stopped."
     } else {
-        Write-Host "$P is not running." -ForegroundColor Yellow
+        Write-Host "${Yellow}[Warning]${NC} $P is not running."
     }
 }
 Clear-DnsClientCache
@@ -17,12 +35,12 @@ function VerifyHash {
     $Digest = $Response.assets | Where-Object { $_.name -eq "$FileName" } | Select-Object -ExpandProperty digest
     $RemoteHash = $Digest.Split(':')[-1]
     $LocalHash = (Get-FileHash $FilePath -Algorithm SHA256).Hash.ToLower()
-    Write-Host "Verifying SHA256 checksum... " -NoNewline
+    Write-Host "${Cyan}[Notice]${NC} Verifying file integrity..."
     if ($RemoteHash -eq $LocalHash) {
-        Write-Host "Correct!" -ForegroundColor Green
+        Write-Host "${Green}[Success]${NC} File is intact."
         return $true
     } else {
-        Write-Host "Wrong!" -ForegroundColor Red
+        Write-Host "${Red}[Error]${NC} File is corrupted!"
         return $false
     }
 }
@@ -34,13 +52,13 @@ function Upgrade {
         if (Test-Path -Path $FilePath) {
             Remove-Item -Force $FilePath
         }
-        Write-Host "Downloading..."
+        Write-Host "${Cyan}[Notice]${NC} Downloading..."
         Invoke-WebRequest -OutFile $FilePath -Uri "https://gh-proxy.org/$Url"
         $Correct = VerifyHash
         if ($Correct) {
             $script:Cover = $true
         } else {
-            Write-Host "Retry Downloading..."
+            Write-Host "${Cyan}[Notice]${NC} Retry downloading..."
             Start-Sleep -Seconds 1
         }
     } until ($Correct)
@@ -59,13 +77,11 @@ function CheckUpdate ($ExeName, $VersionArg) {
     $LocalVersionObj = [System.Version]$LocalVersionStr
     $RemoteVersionObj = [System.Version]$RemoteVersionStr
     if ($RemoteVersionObj -gt $LocalVersionObj) {
-        Write-Host "version: $LocalVersionStr -> " -NoNewline
-        Write-Host "$RemoteVersionStr" -ForegroundColor Yellow
+        Write-Host "${Yellow}[Warning]${NC} New version: ${Yellow}$LocalVersionStr${NC} -> ${Green}$RemoteVersionStr${NC}"
         Upgrade
     }
     else {
-        Write-Host "Up to date: " -NoNewline
-        Write-Host "$ExeName $LocalVersionStr" -ForegroundColor Green
+        Write-Host "${Green}[Success]${NC} Up to date: $ExeName ${Green}$LocalVersionStr${NC}"
     }
 }
 # ---- 公共函数 结束 ----
@@ -73,6 +89,7 @@ function CheckUpdate ($ExeName, $VersionArg) {
 $WorkDir = "$env:USERPROFILE\Apps\sing-box-with-xray"
 
 # ---- 更新 sing-box ----
+Write-Host "${Cyan}[Notice]${NC} Checking sing-box updates..."
 $ExePath = "$WorkDir\sing-box.exe"
 $Response = Invoke-RestMethod -Uri "https://api.github.com/repos/SagerNet/sing-box/releases/latest" -Method Get
 $TagName = $Response.tag_name
@@ -93,6 +110,7 @@ if ($script:Cover) {
 # ---- 更新 sing-box 结束 ----
 
 # ---- 更新 xray ----
+Write-Host "${Cyan}[Notice]${NC} Checking xray updates..."
 $ExePath = "$WorkDir\xray.exe"
 $Response = Invoke-RestMethod -Uri "https://api.github.com/repos/XTLS/Xray-core/releases/latest" -Method Get
 $TagName = $Response.tag_name
@@ -113,6 +131,7 @@ if ($script:Cover) {
 # ---- 更新 xray 结束 ----
 
 # ---- 更新 jq ----
+Write-Host "${Cyan}[Notice]${NC} Checking jq updates..."
 $ExePath = "$WorkDir\jq.exe"
 $Response = Invoke-RestMethod -Uri "https://api.github.com/repos/jqlang/jq/releases/latest" -Method Get
 $TagName = $Response.tag_name

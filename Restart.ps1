@@ -1,10 +1,29 @@
+$ESC = [char]27
+$Black = "$ESC[90m"
+$Red = "$ESC[91m"       # [Error]
+$Green = "$ESC[92m"     # [Success]
+$Yellow = "$ESC[93m"    # [Warning]
+$Blue = "$ESC[94m"
+$Magenta = "$ESC[95m"
+$Cyan = "$ESC[96m"      # [Notice]
+$White = "$ESC[97m"
+$NC = "$ESC[0m"         # No Color
+
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Host "${Red}[Error]${NC} Please run this script as Administrator."
+    exit 1
+}
+
 $Process = @("sing-box", "xray")
 foreach ($P in $Process) {
     if (Get-Process $P -ErrorAction SilentlyContinue) {
         Stop-Process -Name $P -Force
-        Write-Host "$P has stopped." -ForegroundColor Green
+        Write-Host "${Green}[Success]${NC} $P has stopped."
     } else {
-        Write-Host "$P is not running." -ForegroundColor Yellow
+        Write-Host "${Yellow}[Warning]${NC} $P is not running."
     }
 }
 Clear-DnsClientCache
@@ -19,22 +38,36 @@ if (Test-Path $ConfigPath) {
     if ($LASTEXITCODE -eq 0 -and $JsonResult) {
         [System.IO.File]::WriteAllLines($TempPath, $JsonResult)
         Move-Item -Path $TempPath -Destination $ConfigPath -Force
-        Write-Host "Success: TUN interface name randomized." -ForegroundColor Green
+        Write-Host "${Green}[Success]${NC} TUN interface name randomized."
+        Write-Host "${Cyan}[Notice]${NC} Starting sing-box..."
+        Start-Process -FilePath "$WorkDir\sing-box.exe" -ArgumentList "run -D $WorkDir -c $ConfigPath" -WindowStyle Hidden
     } else {
-        Write-Host "Error: TUN interface name randomization failed." -ForegroundColor Red
+        Write-Host "${Red}[Error]${NC} TUN interface name randomization failed."
         pause
         exit
     }
 } else {
-    Write-Host "Error: File not found at $ConfigPath" -ForegroundColor Red
+    Write-Host "${Red}[Error]${NC} File not found: $ConfigPath"
     pause
     exit
 }
 
-Write-Host "Start sing-box and xray..." -ForegroundColor Cyan
-Start-Process -FilePath "$WorkDir\sing-box.exe" -ArgumentList "run -D $WorkDir -c $WorkDir\sing-box.json" -WindowStyle Hidden
-Start-Sleep -Seconds 1
-Start-Process -FilePath "$WorkDir\xray.exe" -ArgumentList "run -c $WorkDir\xray.json" -WindowStyle Hidden
-Start-Sleep -Seconds 1
-Get-Process -Name sing-box,xray
+Write-Host "${Cyan}[Notice]${NC} Starting xray..."
+$ConfigPath = "$WorkDir\xray.json"
+if (Test-Path $ConfigPath) {
+    Start-Process -FilePath "$WorkDir\xray.exe" -ArgumentList "run -c $ConfigPath" -WindowStyle Hidden
+} else {
+    Write-Host "${Red}[Error]${NC} File not found: $ConfigPath"
+    pause
+    exit
+}
+
+Start-Sleep -Seconds 2
+foreach ($P in $Process) {
+    if (Get-Process $P -ErrorAction SilentlyContinue) {
+        Write-Host "${Green}[Success]${NC} $P is running."
+    } else {
+        Write-Host "${Red}[Error]${NC} $P is not running."
+    }
+}
 Start-Sleep -Seconds 1
