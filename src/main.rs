@@ -28,7 +28,7 @@ use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::prelude::*;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Console::{
@@ -36,7 +36,9 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetSystemTime;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+use windows::core::PCWSTR;
 
 use crate::state::ConfigAction;
 
@@ -62,6 +64,52 @@ impl Drop for ComGuard {
     }
 }
 
+/// 单实例锁使用的 Global 命名互斥体名称。
+///
+/// 使用 Global 命名空间实现整机单实例: 即使同一台机器有多个登录会话
+/// (如 RDP) , 也只会运行一个实例。本程序修改系统级网络配置, 跨会话
+/// 并发运行会互相冲突。
+const SINGLE_INSTANCE_MUTEX: &str = "Global\\Ladder.SingleInstance";
+
+/// 单实例互斥体守卫, 防止软件重复启动。
+///
+/// 第一个实例创建命名互斥体并持有句柄; 后续实例创建同一互斥体时
+/// 收到 ERROR_ALREADY_EXISTS, 据此判定已存在运行中的实例。
+/// 句柄在 Drop 时关闭, 进程异常退出时内核也会自动释放互斥体, 无残留锁。
+struct SingleInstanceGuard {
+    handle: HANDLE,
+}
+
+impl SingleInstanceGuard {
+    /// 尝试获取单实例锁。
+    ///
+    /// 返回 `Ok(Some(guard))` 表示本实例获得锁; `Ok(None)` 表示已有
+    /// 实例在运行; `Err` 表示互斥体创建失败 (如权限不足) , 调用方
+    /// 应降级为允许启动, 避免误伤正常使用。
+    fn acquire() -> Result<Option<Self>, AppError> {
+        let name = state::wide(SINGLE_INSTANCE_MUTEX);
+        unsafe {
+            let handle = CreateMutexW(None, false, PCWSTR(name.as_ptr()))
+                .map_err(|e| AppError::Msg(format!("创建单实例互斥体失败: {e}")))?;
+            let already_exists = std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ALREADY_EXISTS.0 as i32);
+            if already_exists {
+                let _ = CloseHandle(handle);
+                Ok(None)
+            } else {
+                Ok(Some(Self { handle }))
+            }
+        }
+    }
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
 /// 在后台线程中安全执行闭包, 捕获 panic 并通过 Toast 通知用户。
 fn spawn_safe<F: FnOnce() + Send + 'static>(name: &str, f: F) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
@@ -77,6 +125,18 @@ fn spawn_safe<F: FnOnce() + Send + 'static>(name: &str, f: F) {
 }
 
 fn main() {
+    let _guard = match SingleInstanceGuard::acquire() {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => {
+            tray::show_warn(0, "请勿重复启动", "软件已在运行, 请勿重复启动, 你可以在右下角的托盘中找到它");
+            return;
+        }
+        Err(err) => {
+            eprintln!("创建单实例互斥体失败: {err}");
+            None
+        }
+    };
+
     if let Err(err) = run() {
         tray::show_error(0, "启动失败", &err.to_string());
     }

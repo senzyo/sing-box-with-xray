@@ -18,8 +18,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DI_NORMAL, DefWindowProcW,
     DestroyIcon, DestroyMenu, DispatchMessageW, DrawIconEx, GetCursorPos, GetMenuItemCount, GetMessageW, HICON, HMENU,
-    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadIconW, LoadImageW, MB_ICONERROR, MB_OK,
-    MENUITEMINFOW, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MSG, MessageBoxW, PostMessageW,
+    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadIconW, LoadImageW, MB_ICONERROR, MB_ICONWARNING,
+    MB_OK, MENUITEMINFOW, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MSG, MessageBoxW, PostMessageW,
     PostQuitMessage, RegisterClassW, SetForegroundWindow, SetMenuItemInfoW, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
     WNDCLASSW, WS_OVERLAPPED,
@@ -144,6 +144,19 @@ pub fn show_error(hwnd: isize, title: &str, message: &str) {
             &HSTRING::from(message),
             &HSTRING::from(title),
             MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+/// 显示警告消息对话框。
+pub fn show_warn(hwnd: isize, title: &str, message: &str) {
+    let hwnd = if hwnd == 0 { None } else { Some(HWND(hwnd as _)) };
+    unsafe {
+        let _ = MessageBoxW(
+            hwnd,
+            &HSTRING::from(message),
+            &HSTRING::from(title),
+            MB_OK | MB_ICONWARNING,
         );
     }
 }
