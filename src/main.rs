@@ -128,7 +128,11 @@ fn main() {
     let _guard = match SingleInstanceGuard::acquire() {
         Ok(Some(guard)) => Some(guard),
         Ok(None) => {
-            tray::show_warn(0, "请勿重复启动", "软件已在运行, 请勿重复启动, 你可以在右下角的托盘中找到它");
+            tray::show_warn(
+                0,
+                "请勿重复启动",
+                "软件已在运行, 请勿重复启动, 你可以在右下角的托盘中找到它",
+            );
             return;
         }
         Err(err) => {

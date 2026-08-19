@@ -664,4 +664,122 @@ mod tests {
         assert!(is_newer("1.0", "1.0.1"));
         assert!(!is_newer("1.0.1", "1.0"));
     }
+
+    #[test]
+    fn test_is_newer_malformed_segments() {
+        // filter_map 静默丢弃非数字段, "1.0.beta" 等价于 "1.0"
+        assert!(is_newer("1.0.beta", "1.0.1"));
+        // 空段被丢弃, "1..0" 等价于 "1.0"
+        assert!(!is_newer("1..0", "1.0.0"));
+        // 全部为空段, 视为空版本 (全 0)
+        assert!(!is_newer("..", "0.0.0"));
+        // 超出 u32 范围的段被丢弃, "4294967296.0" 等价于 "0"
+        assert!(is_newer("4294967296.0", "1.0.0"));
+        // 空字符串视为全 0
+        assert!(!is_newer("", ""));
+    }
+
+    #[test]
+    fn test_sha256_file_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        fs::write(&path, b"").unwrap();
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn test_sha256_file_abc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abc.txt");
+        fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn test_sha256_file_large_multichunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        let data = vec![0xABu8; 20000];
+        fs::write(&path, &data).unwrap();
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "1b53c5e8138cf85261885e5efbd49452254ad6ad365603d05fc7776d5eee93c0"
+        );
+    }
+
+    #[test]
+    fn test_sha256_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.bin");
+        assert!(sha256_file(&path).is_err());
+    }
+
+    fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write as _;
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for &(name, data) in entries {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn test_backup_and_extract_no_strip_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(&zip_path, &[("a.txt", &b"hello"[..]), ("sub/b.txt", &b"world"[..])]);
+        let core_dir = dir.path().join("core");
+
+        backup_and_extract(&zip_path, &core_dir, None).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("a.txt")).unwrap(), "hello");
+        assert_eq!(fs::read_to_string(core_dir.join("sub/b.txt")).unwrap(), "world");
+    }
+
+    #[test]
+    fn test_backup_and_extract_strip_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("sing-box-1.2.3-windows-amd64/sing-box.exe", &b"exe"[..]),
+                ("sing-box-1.2.3-windows-amd64/sub/file.txt", &b"data"[..]),
+            ],
+        );
+        let core_dir = dir.path().join("core");
+
+        backup_and_extract(&zip_path, &core_dir, Some("sing-box-1.2.3-windows-amd64/")).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("sing-box.exe")).unwrap(), "exe");
+        assert_eq!(fs::read_to_string(core_dir.join("sub/file.txt")).unwrap(), "data");
+        assert!(!core_dir.join("sing-box-1.2.3-windows-amd64").exists());
+    }
+
+    #[test]
+    fn test_backup_and_extract_backs_up_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(&zip_path, &[("new.txt", &b"new"[..])]);
+        let core_dir = dir.path().join("core");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(core_dir.join("old.txt"), b"old").unwrap();
+
+        backup_and_extract(&zip_path, &core_dir, None).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("new.txt")).unwrap(), "new");
+        assert!(!core_dir.join("old.txt").exists());
+
+        let backup_dir = dir.path().join("core_backup");
+        assert_eq!(fs::read_to_string(backup_dir.join("old.txt")).unwrap(), "old");
+    }
 }

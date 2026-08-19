@@ -74,12 +74,21 @@ pub struct RulesetEntry {
 }
 
 /// 规则集下载配置。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Ruleset {
     #[serde(flatten)]
     pub entries: HashMap<String, RulesetEntry>,
     #[serde(default = "default_interval_days")]
     pub interval_days: u64,
+}
+
+impl Default for Ruleset {
+    fn default() -> Self {
+        Ruleset {
+            entries: HashMap::new(),
+            interval_days: default_interval_days(),
+        }
+    }
 }
 
 /// 下载配置。
@@ -164,10 +173,12 @@ impl Settings {
             }
         };
 
-        match serde_json::from_str::<Settings>(&text) {
-            Ok(mut s) => {
-                s.validate();
-                s
+        match parse_settings(&text) {
+            Ok((settings, warnings)) => {
+                for w in warnings {
+                    push_warning(w);
+                }
+                settings
             }
             Err(e) => {
                 push_warning(format!("解析配置文件失败 ({}), 使用默认配置: {e}", path.display()));
@@ -193,12 +204,15 @@ impl Settings {
     }
 
     /// 校验配置值合法性, 非法值回退到默认值。
-    fn validate(&mut self) {
+    /// 返回校验过程中产生的警告信息, 由调用方决定如何输出。
+    fn validate(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
         let level = self.log.level.to_lowercase();
         if ALLOWED_LEVELS.contains(&level.as_str()) {
             self.log.level = level;
         } else {
-            push_warning(format!(
+            warnings.push(format!(
                 "无效的日志级别 \"{}\", 可选值: {:?}, 回退到 \"debug\"",
                 self.log.level, ALLOWED_LEVELS
             ));
@@ -206,26 +220,113 @@ impl Settings {
         }
 
         if self.download.retry.max_retries == 0 {
-            push_warning("max_retries 不能为 0, 回退到默认值 3".to_string());
+            warnings.push("max_retries 不能为 0, 回退到默认值 3".to_string());
             self.download.retry.max_retries = 3;
         } else if self.download.retry.max_retries > 10 {
-            push_warning("max_retries 超出上限 10, 已自动限制".to_string());
+            warnings.push("max_retries 超出上限 10, 已自动限制".to_string());
             self.download.retry.max_retries = 10;
         }
 
         if self.download.retry.delay_secs == 0 {
-            push_warning("delay_secs 不能为 0, 回退到默认值 2".to_string());
+            warnings.push("delay_secs 不能为 0, 回退到默认值 2".to_string());
             self.download.retry.delay_secs = 2;
         } else if self.download.retry.delay_secs > 30 {
-            push_warning("delay_secs 超出上限 30, 已自动限制".to_string());
+            warnings.push("delay_secs 超出上限 30, 已自动限制".to_string());
             self.download.retry.delay_secs = 30;
         }
+
+        warnings
     }
+}
+
+/// 解析并校验 JSON 配置字符串, 返回配置与校验警告列表。
+/// 解析失败时返回错误, 由调用方决定回退策略。
+fn parse_settings(text: &str) -> Result<(Settings, Vec<String>), serde_json::Error> {
+    let mut settings = serde_json::from_str::<Settings>(text)?;
+    let warnings = settings.validate();
+    Ok((settings, warnings))
 }
 
 fn push_warning(msg: String) {
     eprintln!("警告: {msg}");
     if let Ok(mut warnings) = LOAD_WARNINGS.lock() {
         warnings.push(msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_settings_defaults() {
+        let (s, warnings) = parse_settings("{}").unwrap();
+        assert_eq!(s.log.level, "debug");
+        assert_eq!(s.download.retry.max_retries, 3);
+        assert_eq!(s.download.retry.delay_secs, 2);
+        assert_eq!(s.download.ruleset.interval_days, 3);
+        assert_eq!(s.core.mode, CoreMode::Xray);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_parse_settings_invalid_json() {
+        assert!(parse_settings("not json").is_err());
+    }
+
+    #[test]
+    fn test_parse_settings_invalid_log_level() {
+        let (s, warnings) = parse_settings(r#"{"log":{"level":"trace"}}"#).unwrap();
+        assert_eq!(s.log.level, "debug");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("无效的日志级别"));
+    }
+
+    #[test]
+    fn test_parse_settings_log_level_normalized() {
+        let (s, warnings) = parse_settings(r#"{"log":{"level":"DEBUG"}}"#).unwrap();
+        assert_eq!(s.log.level, "debug");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_parse_settings_max_retries_bounds() {
+        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"max_retries":0}}}"#).unwrap();
+        assert_eq!(s.download.retry.max_retries, 3);
+        assert_eq!(warnings.len(), 1);
+
+        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"max_retries":11}}}"#).unwrap();
+        assert_eq!(s.download.retry.max_retries, 10);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_settings_delay_secs_bounds() {
+        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"delay_secs":0}}}"#).unwrap();
+        assert_eq!(s.download.retry.delay_secs, 2);
+        assert_eq!(warnings.len(), 1);
+
+        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"delay_secs":31}}}"#).unwrap();
+        assert_eq!(s.download.retry.delay_secs, 30);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_settings_full_valid() {
+        let json = r#"{
+            "log": {"level": "info"},
+            "download": {
+                "core": {"gh_proxy": "https://proxy.example.com/"},
+                "retry": {"max_retries": 5, "delay_secs": 3}
+            },
+            "core": {"mode": "both"}
+        }"#;
+        let (s, warnings) = parse_settings(json).unwrap();
+        assert_eq!(s.log.level, "info");
+        assert_eq!(s.download.core.gh_proxy, "https://proxy.example.com/");
+        assert_eq!(s.download.retry.max_retries, 5);
+        assert_eq!(s.download.retry.delay_secs, 3);
+        assert_eq!(s.core.mode, CoreMode::Both);
+        assert!(warnings.is_empty());
     }
 }
