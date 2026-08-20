@@ -27,19 +27,11 @@
       "tag": "out-proxy",
       "protocol": "vless",
       "settings": {
-        "vnext": [
-          {
-            "address": "<VPS_IPv4>",
-            "port": 443,
-            "users": [
-              {
-                "id": "<XHTTP_UUID>",
-                "flow": "",
-                "encryption": "none"
-              }
-            ]
-          }
-        ]
+        "address": "<VPS_IPv4>",
+        "port": 443,
+        "id": "<XHTTP_UUID>",
+        "flow": "",
+        "encryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",

@@ -27,19 +27,11 @@
       "tag": "out-proxy",
       "protocol": "vless",
       "settings": {
-        "vnext": [
-          {
-            "address": "<Cloudflare_1>",
-            "port": 443,
-            "users": [
-              {
-                "id": "<XHTTP_UUID>",
-                "flow": "",
-                "encryption": "none"
-              }
-            ]
-          }
-        ]
+        "address": "<Cloudflare_1>",
+        "port": 443,
+        "id": "<XHTTP_UUID>",
+        "flow": "",
+        "encryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",

@@ -17,31 +17,36 @@
       ]
     },
     "servers": [
-      "1.1.1.1",
+      {
+        "address": "8.8.8.8",
+        "tag": "dns-google-1"
+      },
       {
         "address": "https+local://dns.alidns.com/dns-query",
         "domains": [
+          "domain:182682.xyz",
+          "domain:chinabaidu.pp.ua",
+          "domain:singgnetworkcdn.com",
+          "domain:xingpingcn.top",
+          "www.visa.cn",
           "geosite:private",
-          "geosite:category-games@cn",
-          "geosite:kaspersky",
-          "cfcn-a-proctusa.chinabaidu.pp.ua",
-          "cf-cname.xingpingcn.top",
-          "singgcdn.singgnetworkcdn.com",
-          "www.shopify.com",
-          "store.ubi.com",
-          "staticdelivery.nexusmods.com"
+          "geosite:category-game-platforms-download@cn"
         ],
-        "skipFallback": true
+        "skipFallback": true,
+        "tag": "dns-ali-1"
       },
       {
         "address": "8.8.8.8",
         "domains": ["geosite:geolocation-!cn"],
-        "skipFallback": true
+        "skipFallback": true,
+        "tag": "dns-google-2"
       },
       {
         "address": "https+local://dns.alidns.com/dns-query",
         "domains": ["geosite:cn"],
-        "skipFallback": true
+        "expectedIPs": ["geoip-only-cn-private:cn"],
+        "skipFallback": true,
+        "tag": "dns-ali-2"
       }
     ],
     "tag": "dns-module",
@@ -78,19 +83,11 @@
       "tag": "out-proxy",
       "protocol": "vless",
       "settings": {
-        "vnext": [
-          {
-            "address": "<VPS_IPv4>",
-            "port": 443,
-            "users": [
-              {
-                "id": "<XHTTP_UUID>",
-                "flow": "",
-                "encryption": "none"
-              }
-            ]
-          }
-        ]
+        "address": "<VPS_IPv4>",
+        "port": 443,
+        "id": "<XHTTP_UUID>",
+        "flow": "",
+        "encryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
@@ -159,23 +156,23 @@
     }
   ],
   "routing": {
-    "domainStrategy": "AsIs",
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
+      {
+        "inboundTag": ["dns-module"],
+        "outboundTag": "out-proxy"
+      },
       {
         "inboundTag": ["in-tun"],
         "port": "53",
         "outboundTag": "out-dns"
       },
       {
-        "inboundTag": ["dns-module"],
-        "outboundTag": "out-proxy"
-      },
-      {
         "domain": ["geosite:private"],
         "outboundTag": "out-direct"
       },
       {
-        "ip": ["ext:geoip-only-cn-private.dat:private"],
+        "ip": ["geoip-only-cn-private:private"],
         "outboundTag": "out-direct"
       },
       {
@@ -184,8 +181,8 @@
         "outboundTag": "out-block"
       },
       {
+        "network": "tcp,udp",
         "port": "853",
-        "protocol": ["tls"],
         "outboundTag": "out-block"
       },
       {
@@ -194,14 +191,12 @@
       },
       {
         "domain": [
-          "geosite:category-games@cn",
-          "geosite:kaspersky",
-          "cfcn-a-proctusa.chinabaidu.pp.ua",
-          "cf-cname.xingpingcn.top",
-          "singgcdn.singgnetworkcdn.com",
-          "www.shopify.com",
-          "store.ubi.com",
-          "staticdelivery.nexusmods.com"
+          "domain:182682.xyz",
+          "domain:chinabaidu.pp.ua",
+          "domain:singgnetworkcdn.com",
+          "domain:xingpingcn.top",
+          "www.visa.cn",
+          "geosite:category-game-platforms-download@cn"
         ],
         "outboundTag": "out-direct"
       },
@@ -214,7 +209,7 @@
         "outboundTag": "out-direct"
       },
       {
-        "ip": ["ext:geoip-only-cn-private.dat:cn"],
+        "ip": ["geoip-only-cn-private:cn"],
         "outboundTag": "out-direct"
       }
     ]
