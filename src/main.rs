@@ -353,10 +353,10 @@ fn run() -> Result<(), AppError> {
         .ok_or(AppError::Msg("无法获取 exe 所在目录".into()))?
         .to_path_buf();
 
-    fs::create_dir_all(exe_dir.join("sing-box_core"))?;
-    fs::create_dir_all(exe_dir.join("xray_core"))?;
-    fs::create_dir_all(exe_dir.join("configs").join("sing-box"))?;
-    fs::create_dir_all(exe_dir.join("configs").join("xray"))?;
+    for core in state::Core::ALL {
+        fs::create_dir_all(core.core_dir(&exe_dir))?;
+        fs::create_dir_all(core.config_dir(&exe_dir))?;
+    }
 
     let app_settings = settings::Settings::load(&exe_dir);
 
@@ -450,11 +450,11 @@ fn service_command(id: u16) -> Option<ServiceCommand> {
         },
         tray::ID_STOP_SING => ServiceCommand {
             label: "终止 sing-box",
-            run: |_| process::stop_processes(&["sing-box.exe"]),
+            run: |_| process::stop_processes(&[state::Core::SingBox]),
         },
         tray::ID_STOP_XRAY => ServiceCommand {
             label: "终止 xray",
-            run: |_| process::stop_processes(&["xray.exe"]),
+            run: |_| process::stop_processes(&[state::Core::Xray]),
         },
         tray::ID_STOP_ALL => ServiceCommand {
             label: "终止所有服务",
@@ -642,11 +642,11 @@ fn run_config_switch(guard: state::FlagGuard, action: ConfigAction) {
                 return;
             }
         };
-        let (dest_name, restart): (&str, ExeDirFn) = match action.kind {
-            state::ConfigKind::SingBox => ("sing-box.json", process::restart_sing_box_at),
-            state::ConfigKind::Xray => ("xray.json", process::restart_xray_at),
+        let restart: ExeDirFn = match action.core {
+            state::Core::SingBox => process::restart_sing_box_at,
+            state::Core::Xray => process::restart_xray_at,
         };
-        let dest = exe_dir.join("configs").join(dest_name);
+        let dest = action.core.active_config(&exe_dir);
 
         info!("切换配置: {}", action.path.display());
         debug!("复制配置: {} -> {}", action.path.display(), dest.display());

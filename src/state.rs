@@ -19,15 +19,68 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use crate::error::AppError;
 use crate::settings;
 
-#[derive(Clone, Copy)]
-pub enum ConfigKind {
+/// 两个代理核心。
+///
+/// 与核心绑定的文件名和目录名都集中在这里, 避免 "sing-box.exe" 这类字符串
+/// 散落在各模块里被当成类型用 —— 那样拼错只会在运行时表现为"进程没找到"。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Core {
     SingBox,
     Xray,
 }
 
+impl Core {
+    /// 全部核心。顺序与 `CoreStates` 的字段一致, `core_states` 依赖这个顺序。
+    pub const ALL: [Core; 2] = [Core::SingBox, Core::Xray];
+
+    /// 日志与通知里使用的名称。
+    pub fn label(self) -> &'static str {
+        match self {
+            Core::SingBox => "sing-box",
+            Core::Xray => "xray",
+        }
+    }
+
+    /// 可执行文件名。
+    pub fn exe_name(self) -> &'static str {
+        match self {
+            Core::SingBox => "sing-box.exe",
+            Core::Xray => "xray.exe",
+        }
+    }
+
+    /// 核心的工作目录 (放可执行文件、规则集等) 。
+    pub fn core_dir(self, exe_dir: &Path) -> PathBuf {
+        let name = match self {
+            Core::SingBox => "sing-box_core",
+            Core::Xray => "xray_core",
+        };
+        exe_dir.join(name)
+    }
+
+    /// 可执行文件的完整路径。
+    pub fn exe_path(self, exe_dir: &Path) -> PathBuf {
+        self.core_dir(exe_dir).join(self.exe_name())
+    }
+
+    /// 当前生效的配置文件路径。
+    pub fn active_config(self, exe_dir: &Path) -> PathBuf {
+        let name = match self {
+            Core::SingBox => "sing-box.json",
+            Core::Xray => "xray.json",
+        };
+        exe_dir.join("configs").join(name)
+    }
+
+    /// 可切换配置所在的目录。
+    pub fn config_dir(self, exe_dir: &Path) -> PathBuf {
+        exe_dir.join("configs").join(self.label())
+    }
+}
+
 #[derive(Clone)]
 pub struct ConfigAction {
-    pub kind: ConfigKind,
+    pub core: Core,
     pub path: PathBuf,
 }
 
@@ -37,10 +90,6 @@ pub enum ProcessState {
     NotRunning,
     Running,
 }
-
-/// 两个核心的可执行文件名。顺序与 `CoreStates` 的字段一致, `core_states`
-/// 依赖这个顺序解构 `running_flags` 的返回值。
-pub const CORE_EXE_NAMES: [&str; 2] = ["sing-box.exe", "xray.exe"];
 
 /// 全局应用状态。
 pub struct AppState {
@@ -54,6 +103,24 @@ pub struct AppState {
     /// 子进程句柄, 用于直接 kill。
     pub child_sing_box: Option<Child>,
     pub child_xray: Option<Child>,
+}
+
+impl AppState {
+    /// 取出核心的子进程句柄, 同时从状态中移除。
+    pub fn take_child(&mut self, core: Core) -> Option<Child> {
+        match core {
+            Core::SingBox => self.child_sing_box.take(),
+            Core::Xray => self.child_xray.take(),
+        }
+    }
+
+    /// 记录核心的子进程句柄。
+    pub fn set_child(&mut self, core: Core, child: Child) {
+        match core {
+            Core::SingBox => self.child_sing_box = Some(child),
+            Core::Xray => self.child_xray = Some(child),
+        }
+    }
 }
 
 /// 全局应用状态, 通过 OnceLock + Mutex 实现线程安全的单例。
@@ -225,12 +292,11 @@ pub struct CoreStates {
 /// 毫秒级的系统调用, 调用方应当先从 Mutex 里复制出 exe_dir、释放锁, 再调用
 /// 本函数, 否则打开托盘菜单期间会一直持锁, 阻塞需要写状态的后台线程。
 pub fn core_states(exe_dir: &Path) -> CoreStates {
-    let sing_box_installed = exe_dir.join("sing-box_core").join("sing-box.exe").exists();
-    let xray_installed = exe_dir.join("xray_core").join("xray.exe").exists();
+    let [sing_box_installed, xray_installed] = Core::ALL.map(|core| core.exe_path(exe_dir).exists());
 
     // 两个核心都没装就不必枚举进程
     let [sing_box_running, xray_running] = if sing_box_installed || xray_installed {
-        running_flags(&CORE_EXE_NAMES)
+        running_flags(&Core::ALL.map(Core::exe_name))
     } else {
         [false; 2]
     };
@@ -323,5 +389,18 @@ mod tests {
         assert!(matches!(process_state(false, true), ProcessState::NotInstalled));
         assert!(matches!(process_state(true, false), ProcessState::NotRunning));
         assert!(matches!(process_state(true, true), ProcessState::Running));
+    }
+
+    /// 这些路径是 Release 目录结构的一部分, 改动会破坏已有安装, 钉在测试里。
+    #[test]
+    fn test_core_paths() {
+        let base = Path::new("base");
+
+        assert_eq!(Core::SingBox.exe_path(base), base.join("sing-box_core/sing-box.exe"));
+        assert_eq!(Core::Xray.exe_path(base), base.join("xray_core/xray.exe"));
+        assert_eq!(Core::SingBox.active_config(base), base.join("configs/sing-box.json"));
+        assert_eq!(Core::Xray.active_config(base), base.join("configs/xray.json"));
+        assert_eq!(Core::SingBox.config_dir(base), base.join("configs/sing-box"));
+        assert_eq!(Core::Xray.config_dir(base), base.join("configs/xray"));
     }
 }

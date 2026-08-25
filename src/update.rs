@@ -14,6 +14,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::error::AppError;
+use crate::state::Core;
 
 /// GitHub API 要求的 User-Agent 头, 缺少会返回 403。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
@@ -79,7 +80,7 @@ pub fn update_cores(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_
 
 /// 检查并更新 sing-box。
 pub fn update_sing_box(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_secs: u64) -> Result<(), AppError> {
-    let exe_path = exe_dir.join("sing-box_core").join("sing-box.exe");
+    let exe_path = Core::SingBox.exe_path(exe_dir);
 
     let local = get_local_version(&exe_path, "version");
     let (remote_ver, assets) = fetch_sing_box_release()?;
@@ -116,7 +117,7 @@ pub fn update_sing_box(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, del
         return Ok(());
     }
 
-    let core_dir = exe_dir.join("sing-box_core");
+    let core_dir = Core::SingBox.core_dir(exe_dir);
     let nested_prefix = format!("sing-box-{}-windows-{}/", remote_ver, SINGBOX_ARCH_SUFFIX);
     backup_and_extract(&zip_path, &core_dir, Some(&nested_prefix))?;
 
@@ -128,7 +129,7 @@ pub fn update_sing_box(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, del
 
 /// 检查并更新 xray。
 pub fn update_xray(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_secs: u64) -> Result<(), AppError> {
-    let exe_path = exe_dir.join("xray_core").join("xray.exe");
+    let exe_path = Core::Xray.exe_path(exe_dir);
 
     let local = get_local_version(&exe_path, "version");
     let (remote_ver, assets) = fetch_xray_release(XRAY_ZIP_NAME)?;
@@ -165,7 +166,7 @@ pub fn update_xray(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_s
         return Ok(());
     }
 
-    let core_dir = exe_dir.join("xray_core");
+    let core_dir = Core::Xray.core_dir(exe_dir);
     backup_and_extract(&zip_path, &core_dir, None)?;
 
     let _ = fs::remove_file(&zip_path);
@@ -546,8 +547,8 @@ pub fn update_ruleset(
             }
         };
 
-        let dat_path = exe_dir.join("xray_core").join(format!("{name}.dat"));
-        let tmp_path = exe_dir.join("xray_core").join(format!("{name}.dat.tmp"));
+        let dat_path = Core::Xray.core_dir(exe_dir).join(format!("{name}.dat"));
+        let tmp_path = Core::Xray.core_dir(exe_dir).join(format!("{name}.dat.tmp"));
 
         match download_ruleset_with_retry(&entry.dat, &tmp_path, &expected_hash, max_retries, delay_secs) {
             Ok(_) => {

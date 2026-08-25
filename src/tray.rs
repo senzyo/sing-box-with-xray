@@ -28,7 +28,7 @@ use windows::core::{HSTRING, PCWSTR};
 
 use crate::error::AppError;
 use crate::settings::CoreMode;
-use crate::state::{self, ConfigAction, ConfigKind, ProcessState};
+use crate::state::{self, ConfigAction, Core, ProcessState};
 use tracing::warn;
 
 /// 托盘图标的自定义消息 ID, 当托盘收到鼠标事件时通过此消息通知窗口。
@@ -353,12 +353,16 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
         if core_mode.runs_sing_box() {
             append_status_item(
                 menu,
-                &status_label(states.sing_box, "sing-box"),
+                &status_label(states.sing_box, Core::SingBox.label()),
                 status_hbmp(states.sing_box),
             );
         }
         if core_mode.runs_xray() {
-            append_status_item(menu, &status_label(states.xray, "xray"), status_hbmp(states.xray));
+            append_status_item(
+                menu,
+                &status_label(states.xray, Core::Xray.label()),
+                status_hbmp(states.xray),
+            );
         }
         append_separator(menu);
 
@@ -388,16 +392,16 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             append_config_items(
                 &mut config_actions,
                 sing_menu,
-                ConfigKind::SingBox,
+                Core::SingBox,
                 ID_SING_CONFIG_BASE,
-                &[exe_dir.join("configs").join("sing-box")],
+                &[Core::SingBox.config_dir(&exe_dir)],
             );
             append_config_items(
                 &mut config_actions,
                 xray_menu,
-                ConfigKind::Xray,
+                Core::Xray,
                 ID_XRAY_CONFIG_BASE,
-                &[exe_dir.join("configs").join("xray")],
+                &[Core::Xray.config_dir(&exe_dir)],
             );
 
             append_submenu(menu, restart_menu, "重新启动");
@@ -407,23 +411,21 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             append_submenu(menu, xray_menu, "切换 xray 配置");
         } else {
             // 单核模式: 操作项为直接可点击的一级菜单
-            let (restart_id, stop_id, update_id, config_kind, config_base, config_dir) = if core_mode.runs_xray() {
+            let (restart_id, stop_id, update_id, core, config_base) = if core_mode.runs_xray() {
                 (
                     ID_RESTART_XRAY,
                     ID_STOP_XRAY,
                     ID_UPDATE_XRAY,
-                    ConfigKind::Xray,
+                    Core::Xray,
                     ID_XRAY_CONFIG_BASE,
-                    exe_dir.join("configs").join("xray"),
                 )
             } else {
                 (
                     ID_RESTART_SING,
                     ID_STOP_SING,
                     ID_UPDATE_SING,
-                    ConfigKind::SingBox,
+                    Core::SingBox,
                     ID_SING_CONFIG_BASE,
-                    exe_dir.join("configs").join("sing-box"),
                 )
             };
 
@@ -435,9 +437,9 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             append_config_items(
                 &mut config_actions,
                 config_menu,
-                config_kind,
+                core,
                 config_base,
-                &[config_dir],
+                &[core.config_dir(&exe_dir)],
             );
             append_submenu(menu, config_menu, "切换配置");
         }
@@ -556,7 +558,7 @@ unsafe fn append_submenu(menu: HMENU, submenu: HMENU, label: &str) {
 unsafe fn append_config_items(
     map: &mut HashMap<u16, ConfigAction>,
     menu: HMENU,
-    kind: ConfigKind,
+    core: Core,
     base_id: u16,
     dirs: &[PathBuf],
 ) {
@@ -574,7 +576,7 @@ unsafe fn append_config_items(
                 .unwrap_or("未命名配置")
                 .to_string();
             append_item(menu, id, &label);
-            map.insert(id, ConfigAction { kind, path });
+            map.insert(id, ConfigAction { core, path });
             added += 1;
         }
 

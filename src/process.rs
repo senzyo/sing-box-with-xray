@@ -60,8 +60,9 @@ fn forward_stderr(child: &mut std::process::Child, label: &str) {
 
 /// 启动 sing-box 子进程。启动前随机化 TUN 接口名。
 pub fn start_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
-    let exe = exe_dir.join("sing-box_core").join("sing-box.exe");
-    let config = exe_dir.join("configs").join("sing-box.json");
+    let core = state::Core::SingBox;
+    let exe = core.exe_path(exe_dir);
+    let config = core.active_config(exe_dir);
 
     state::ensure_exists(&exe)?;
     state::ensure_exists(&config)?;
@@ -70,7 +71,7 @@ pub fn start_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
     info!("启动 sing-box");
     let mut child = hidden_command(exe)
         .args(["run", "-D"])
-        .arg(exe_dir.join("sing-box_core"))
+        .arg(core.core_dir(exe_dir))
         .arg("-c")
         .arg(config)
         .current_dir(exe_dir)
@@ -78,9 +79,9 @@ pub fn start_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| AppError::Msg(format!("启动 sing-box 失败: {e}")))?;
-    forward_stderr(&mut child, "sing-box");
+    forward_stderr(&mut child, core.label());
     if let Some(mut app) = state::app_state_mut() {
-        app.child_sing_box = Some(child);
+        app.set_child(core, child);
     }
 
     Ok(())
@@ -88,8 +89,9 @@ pub fn start_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
 
 /// 启动 xray 子进程。启动前随机化 TUN 接口名。
 pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
-    let exe = exe_dir.join("xray_core").join("xray.exe");
-    let config = exe_dir.join("configs").join("xray.json");
+    let core = state::Core::Xray;
+    let exe = core.exe_path(exe_dir);
+    let config = core.active_config(exe_dir);
 
     state::ensure_exists(&exe)?;
     state::ensure_exists(&config)?;
@@ -128,9 +130,9 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
         dns::set_physical_dns_to_local();
     }
 
-    forward_stderr(&mut child, "xray");
+    forward_stderr(&mut child, core.label());
     if let Some(mut app) = state::app_state_mut() {
-        app.child_xray = Some(child);
+        app.set_child(core, child);
     }
 
     Ok(())
@@ -142,7 +144,7 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
 
 /// 终止所有已知子进程并刷新 DNS。
 pub fn stop_all() -> Result<(), AppError> {
-    stop_processes(&state::CORE_EXE_NAMES)
+    stop_processes(&state::Core::ALL)
 }
 
 /// 按进程名终止两个核心并恢复网络状态, 全程不触碰 `AppState`。
@@ -151,45 +153,35 @@ pub fn stop_all() -> Result<(), AppError> {
 /// panic 完全可能发生在持锁期间, 此时再取同一把锁就是自死锁。这里跳过 Child
 /// 句柄, 只按名字终止, 因此不存在这个风险。
 pub fn kill_cores_without_state() {
-    for name in state::CORE_EXE_NAMES {
-        kill_processes_by_name(name);
+    for core in state::Core::ALL {
+        kill_processes_by_name(core.exe_name());
     }
     dns::restore_dns_to_dhcp();
     flush_dns();
 }
 
-/// 终止指定进程列表。先通过保存的 Child 句柄直接 kill,
+/// 终止指定核心。先通过保存的 Child 句柄直接 kill,
 /// 再通过进程名枚举兜底 (覆盖其他来源启动的同名进程) 。
-pub fn stop_processes(processes: &[&str]) -> Result<(), AppError> {
+pub fn stop_processes(cores: &[state::Core]) -> Result<(), AppError> {
     // 阶段 1: 从 mutex 中取出 Child 句柄 (持锁时间极短)
-    let children: Vec<(String, Option<std::process::Child>)> = match state::app_state_mut() {
-        Some(mut app) => processes
-            .iter()
-            .map(|&p| {
-                let child = match p {
-                    "sing-box.exe" => app.child_sing_box.take(),
-                    "xray.exe" => app.child_xray.take(),
-                    _ => None,
-                };
-                (p.to_string(), child)
-            })
-            .collect(),
-        None => processes.iter().map(|&p| (p.to_string(), None)).collect(),
+    let children: Vec<(state::Core, Option<std::process::Child>)> = match state::app_state_mut() {
+        Some(mut app) => cores.iter().map(|&core| (core, app.take_child(core))).collect(),
+        None => cores.iter().map(|&core| (core, None)).collect(),
     };
     // 阶段 2: kill (锁已释放, 不阻塞其他线程)
-    for (name, child) in children {
+    for (core, child) in children {
         if let Some(mut c) = child {
-            info!("终止子进程: {name}");
+            info!("终止子进程: {}", core.exe_name());
             let _ = c.kill();
         }
     }
     // 阶段 3: 通过进程名枚举兜底 (覆盖其他来源启动的同名进程)
-    for process in processes {
-        info!("终止进程: {process}");
-        kill_processes_by_name(process);
+    for core in cores {
+        info!("终止进程: {}", core.exe_name());
+        kill_processes_by_name(core.exe_name());
     }
-    // 如果停止的进程包含 xray, 恢复物理网卡 DNS
-    if processes.contains(&"xray.exe") {
+    // xray 的 TUN 模式会劫持物理网卡 DNS, 停止时必须恢复
+    if cores.contains(&state::Core::Xray) {
         dns::restore_dns_to_dhcp();
     }
     flush_dns();
@@ -292,13 +284,13 @@ pub fn restart_all_at(exe_dir: &Path) -> Result<(), AppError> {
 }
 
 pub fn restart_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
-    stop_processes(&["sing-box.exe"])?;
+    stop_processes(&[state::Core::SingBox])?;
     cleanup_orphaned_wintun();
     start_sing_box_at(exe_dir)
 }
 
 pub fn restart_xray_at(exe_dir: &Path) -> Result<(), AppError> {
-    stop_processes(&["xray.exe"])?;
+    stop_processes(&[state::Core::Xray])?;
     cleanup_orphaned_wintun();
     start_xray_at(exe_dir)?;
     spawn_ruleset_update();
