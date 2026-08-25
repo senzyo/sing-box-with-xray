@@ -109,29 +109,40 @@ impl Drop for SingleInstanceGuard {
     }
 }
 
-/// 执行闭包并捕获 panic, 通过 Toast 通知用户。
+/// 安装 panic 钩子, 在进程终止前恢复被本程序改动的系统状态。
 ///
-/// 注意这个函数本身不创建线程, 只负责 panic 兜底; 创建线程的是 `spawn_bg`。
-fn run_catching_panic<F: FnOnce()>(name: &str, f: F) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    if let Err(e) = result {
-        let msg = e
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| e.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "未知内部错误".to_string());
-        error!("后台线程 [{name}] panic: {msg}");
-        toast::show_toast("内部错误", &msg);
-    }
+/// release 构建用 `panic = "abort"` (原因见 Cargo.toml) , panic 不展开, Drop 和
+/// catch_unwind 都不会执行。但 panic 钩子会在 abort 之前被调用, 所以把必须做的
+/// 清理放在这里。
+///
+/// 关键是物理网卡 DNS: xray 的 TUN 模式期间它被劫持到 127.0.0.1, 进程直接消失
+/// 的话用户既上不了网、又无从察觉原因, 只能等下次启动或开机任务恢复。
+///
+/// 钩子里刻意不调用 `process::stop_all`: 那条路径要取 `AppState` 的 Mutex, 而
+/// panic 完全可能发生在持锁期间, 再取同一把锁就是自死锁。改用不涉及 Mutex 的
+/// `kill_cores_without_state`。同理也不弹 Toast: 那要走 COM, 且失败时会回退到
+/// 阻塞式 MessageBox, 在即将 abort 的进程里风险大于收益。
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<未命名>");
+        error!("线程 [{name}] panic, 终止前恢复网络状态: {info}");
+        process::kill_cores_without_state();
+        default_hook(info);
+    }));
 }
 
 /// 把操作放到后台线程执行, 避免阻塞托盘的消息循环。
 ///
-/// `guard` 被 move 进线程, 无论闭包正常结束还是 panic 展开, 忙标志都会在
-/// 线程退出时释放。线程创建失败时闭包连同 `guard` 一起在此处 drop, 同样
-/// 不会泄漏忙标志。
+/// `guard` 被 move 进线程, 闭包结束时随之释放忙标志。线程创建失败时闭包连同
+/// `guard` 一起在此处 drop, 同样不会泄漏忙标志。
 ///
 /// 线程内独立初始化 COM: Toast 通知需要 COM, 而 COM 的初始化是线程局部的。
+///
+/// 闭包内的 panic 不在这里兜底 —— release 构建是 abort, 展开根本不会发生,
+/// 清理由 `install_panic_hook` 负责。`name` 会成为线程名, panic 日志据此
+/// 指出是哪个后台操作出的问题。
 fn spawn_bg<F: FnOnce() + Send + 'static>(name: &'static str, guard: state::BusyGuard, f: F) {
     let spawned = std::thread::Builder::new().name(name.to_owned()).spawn(move || {
         let _busy = guard;
@@ -142,7 +153,7 @@ fn spawn_bg<F: FnOnce() + Send + 'static>(name: &'static str, guard: state::Busy
                 None
             }
         };
-        run_catching_panic(name, f);
+        f();
     });
 
     if let Err(e) = spawned {
@@ -280,6 +291,8 @@ fn run() -> Result<(), AppError> {
     let app_settings = settings::Settings::load(&exe_dir);
 
     init_logging(&exe_dir, &app_settings.log.level)?;
+    // 尽早安装: 之后的任何 panic 都要走清理路径恢复 DNS
+    install_panic_hook();
     for w in settings::Settings::take_warnings() {
         warn!("{w}");
     }

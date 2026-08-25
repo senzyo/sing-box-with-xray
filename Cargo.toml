@@ -50,4 +50,11 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+# 保留 abort: 在 opt-level = "z" + LTO 下改成 unwind 会让 exe 从 2076 KB 涨到
+# 2660 KB (+584 KB / +28%) , 代价来自遍布 windows crate 调用点的 landing pad。
+#
+# abort 下 panic 不展开, Drop 和 catch_unwind 都不会执行, 但 panic 钩子仍会在
+# abort 之前被调用。必须做的清理 (恢复物理网卡 DNS、终止核心进程) 因此放在
+# main::install_panic_hook 里, 见那里的说明。
 panic = "abort"
+
