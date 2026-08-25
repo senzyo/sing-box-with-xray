@@ -417,29 +417,29 @@ fn backup_and_extract(zip_path: &Path, core_dir: &Path, strip_prefix: Option<&st
             .by_index(i)
             .map_err(|e| AppError::Msg(format!("读取 zip 条目失败: {e}")))?;
 
-        let raw_name = entry.name().to_string();
-
-        let rel_path = match strip_prefix {
-            Some(prefix) => {
-                if let Some(rest) = raw_name.strip_prefix(prefix) {
-                    rest.to_string()
-                } else {
-                    continue;
-                }
-            }
-            None => raw_name,
+        // enclosed_name 会拒绝绝对路径、含 NULL 字节, 以及用 .. 逃出目标目录的条目。
+        //
+        // 不能改回 name() 自行拼接后用 starts_with 判断: Path::starts_with 是按
+        // 组件的词法比较, 不解析 .., 因此 core_dir/../evil 会被判定为 core_dir
+        // 的子路径, 检查形同虚设。
+        let Some(entry_path) = entry.enclosed_name() else {
+            warn!("zip 条目路径不安全, 跳过: {}", entry.name());
+            continue;
         };
 
-        if rel_path.is_empty() {
+        let rel_path = match strip_prefix {
+            Some(prefix) => match entry_path.strip_prefix(prefix) {
+                Ok(rest) => rest.to_path_buf(),
+                Err(_) => continue,
+            },
+            None => entry_path,
+        };
+
+        if rel_path.as_os_str().is_empty() {
             continue;
         }
 
         let out_path = core_dir.join(&rel_path);
-
-        if !out_path.starts_with(core_dir) {
-            warn!("zip 条目路径越界, 跳过: {}", rel_path);
-            continue;
-        }
 
         if entry.is_dir() {
             fs::create_dir_all(&out_path).map_err(|e| AppError::Msg(format!("创建目录失败: {e}")))?;
@@ -765,6 +765,47 @@ mod tests {
         assert_eq!(fs::read_to_string(core_dir.join("sing-box.exe")).unwrap(), "exe");
         assert_eq!(fs::read_to_string(core_dir.join("sub/file.txt")).unwrap(), "data");
         assert!(!core_dir.join("sing-box-1.2.3-windows-amd64").exists());
+    }
+
+    /// 路径穿越条目必须被跳过, 不能写到 core_dir 之外。
+    #[test]
+    fn test_backup_and_extract_rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(
+            &zip_path,
+            &[("../evil.txt", &b"pwned"[..]), ("good.txt", &b"ok"[..])],
+        );
+        let core_dir = dir.path().join("core");
+
+        backup_and_extract(&zip_path, &core_dir, None).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("good.txt")).unwrap(), "ok");
+        assert!(
+            !dir.path().join("evil.txt").exists(),
+            "路径穿越条目被写到了 core_dir 之外"
+        );
+    }
+
+    /// 剥离顶层目录时, 穿越到目标目录之外的条目同样必须被跳过。
+    #[test]
+    fn test_backup_and_extract_rejects_traversal_with_strip_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("sing-box-1.2.3-windows-amd64/sing-box.exe", &b"exe"[..]),
+                ("sing-box-1.2.3-windows-amd64/../../evil.txt", &b"pwned"[..]),
+            ],
+        );
+        let core_dir = dir.path().join("core");
+
+        backup_and_extract(&zip_path, &core_dir, Some("sing-box-1.2.3-windows-amd64/")).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("sing-box.exe")).unwrap(), "exe");
+        assert!(!dir.path().join("evil.txt").exists());
+        assert!(!dir.path().parent().unwrap().join("evil.txt").exists());
     }
 
     #[test]
