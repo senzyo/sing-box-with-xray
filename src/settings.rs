@@ -131,7 +131,7 @@ fn default_log_level() -> String {
 }
 
 fn default_log_max_size_mb() -> u64 {
-    10
+    5
 }
 
 fn default_max_retries() -> u32 {
@@ -293,6 +293,7 @@ mod tests {
     fn test_parse_settings_defaults() {
         let (s, warnings) = parse_settings("{}").unwrap();
         assert_eq!(s.log.level, "debug");
+        assert_eq!(s.log.max_size_mb, 5);
         assert_eq!(s.download.retry.max_retries, 3);
         assert_eq!(s.download.retry.delay_secs, 2);
         assert_eq!(s.download.ruleset.interval_days, 3);

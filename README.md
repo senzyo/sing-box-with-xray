@@ -92,6 +92,7 @@ flowchart LR
 | 配置项                               | 默认值           | 说明                                         |
 | ------------------------------------ | ---------------- | -------------------------------------------- |
 | `log.level`                          | `debug`          | 日志级别                                     |
+| `log.max_size_mb`                    | `5`              | 日志文件大小上限 (MB) , 0 表示不限制         |
 | `download.core.gh_proxy`             | 为空时表示不启用 | GitHub CDN 代理地址前缀                      |
 | `download.ruleset`                   |                  | Xray 的规则集文件                            |
 | `download.ruleset.geoip.last_update` |                  | `geoip.dat` 的上次更新时间, 使用 unix 时间戳 |

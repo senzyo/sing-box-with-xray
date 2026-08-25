@@ -1,7 +1,7 @@
 {
   "log": {
     "level": "debug",
-    "max_size_mb": 10
+    "max_size_mb": 5
   },
   "download": {
     "core": {
