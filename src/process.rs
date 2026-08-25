@@ -267,6 +267,15 @@ pub fn restart_xray_at(exe_dir: &Path) -> Result<(), AppError> {
 // TUN 管理
 // ═══════════════════════════════════════════════
 
+/// sing-box 配置中标识 TUN inbound 的文本片段。
+const SING_BOX_TUN_PATTERN: &str = "\"type\": \"tun\"";
+
+/// xray 配置中标识 TUN inbound 的文本片段。
+const XRAY_TUN_PATTERN: &str = "\"protocol\": \"tun\"";
+
+/// xray inbound 中 settings 块的起始文本片段。
+const XRAY_SETTINGS_PATTERN: &str = "\"settings\": {";
+
 /// 随机化 sing-box 配置中的 TUN 接口名。
 ///
 /// sing-box TUN 适配器在 Windows 上以固定名称注册, 重启时如果旧适配器
@@ -307,18 +316,22 @@ fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
         return fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 sing-box 配置失败: {e}")));
     }
 
-    // 无 interface_name → 在 "type": "tun" 行后插入
+    // 无 interface_name → 紧跟 "type": "tun" 之后插入
+    //
+    // 插入点取 pattern 末尾而非所在行的行尾, 原因有两个:
+    // 1. 行尾插入依赖 "配置是多行缩进" 这一假设。压缩成单行的 JSON 会被写到
+    //    对象外部, 而 tun 标记恰好位于末行且文件无尾随换行时还会索引越界。
+    // 2. 逗号前置 (", \"key\": \"value\"") 后, 无论紧跟的是另一个字段还是
+    //    对象结尾 }, 都不会产生尾随逗号。
     debug!("写入 sing-tun 接口名: {new_name}");
-    let type_pattern = "\"type\": \"tun\"";
     let pos = text
-        .find(type_pattern)
+        .find(SING_BOX_TUN_PATTERN)
         .ok_or(AppError::Msg("未在 sing-box.json 中找到 type=tun 的 inbound".into()))?;
-    let line_end = text[pos..].find('\n').map(|p| pos + p).unwrap_or(text.len());
-    let line_start = text[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
-    let indent = &text[line_start..pos];
-    let insert = format!("{indent}\"interface_name\": \"{new_name}\",\n");
     let mut new_text = text;
-    new_text.insert_str(line_end + 1, &insert);
+    new_text.insert_str(
+        pos + SING_BOX_TUN_PATTERN.len(),
+        &format!(", \"interface_name\": \"{new_name}\""),
+    );
     fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 sing-box 配置失败: {e}")))
 }
 
@@ -359,18 +372,35 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
         return fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 xray 配置失败: {e}")));
     }
 
-    // 无 settings.name → 在 "settings": { 行后插入
+    // 无 settings.name → 写入随机名。
+    //
+    // 与 sing-box 不同, xray 的接口名嵌在 settings 子对象里, 因此分两种情况:
+    // 1. tun inbound 没有 settings 字段: 紧跟 "protocol": "tun" 之后插入整个
+    //    settings 对象, 逗号前置, 不会产生尾随逗号。
+    // 2. 有 settings 但缺 name: 紧跟 "settings": { 之后插入 name。插入点位于
+    //    对象开头, 逗号只能后置, 所以空对象不能补逗号, 否则破坏 JSON。
     debug!("写入 Xray TUN 接口名: {new_name}");
-    let settings_pattern = "\"settings\": {";
+    let (pattern, insert) = match tun_inbound.get("settings") {
+        None => (
+            XRAY_TUN_PATTERN,
+            format!(", \"settings\": {{\"name\": \"{new_name}\"}}"),
+        ),
+        Some(settings) => {
+            let obj = settings
+                .as_object()
+                .ok_or_else(|| AppError::Msg("xray.json 中 tun inbound 的 settings 不是对象".into()))?;
+            let separator = if obj.is_empty() { "" } else { "," };
+            (
+                XRAY_SETTINGS_PATTERN,
+                format!("\"name\": \"{new_name}\"{separator}"),
+            )
+        }
+    };
     let pos = text
-        .find(settings_pattern)
-        .ok_or(AppError::Msg("未在 xray.json 中找到 tun inbound 的 settings 块".into()))?;
-    let line_end = text[pos..].find('\n').map(|p| pos + p).unwrap_or(text.len());
-    let line_start = text[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
-    let indent = &text[line_start..pos];
-    let insert = format!("{indent}  \"name\": \"{new_name}\",\n");
+        .find(pattern)
+        .ok_or_else(|| AppError::Msg(format!("未在 xray.json 中找到 {pattern}")))?;
     let mut new_text = text.to_string();
-    new_text.insert_str(line_end + 1, &insert);
+    new_text.insert_str(pos + pattern.len(), &insert);
     fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 xray 配置失败: {e}")))
 }
 
@@ -551,5 +581,153 @@ mod tests {
         let hex_part = &name1[TUN_PREFIX.len()..];
         assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(name1, name2);
+    }
+
+    /// 写入配置并返回路径。
+    fn write_config(dir: &tempfile::TempDir, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join("config.json");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// 读回配置并解析, 解析失败即说明改写产生了非法 JSON。
+    fn read_json(path: &Path) -> Value {
+        let text = fs::read_to_string(path).unwrap();
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("改写后的 JSON 非法: {e}\n{text}"))
+    }
+
+    fn sing_box_interface_name(json: &Value) -> &str {
+        json["inbounds"][0]["interface_name"].as_str().expect("缺少接口名")
+    }
+
+    fn xray_tun_name(json: &Value) -> &str {
+        json["inbounds"][0]["settings"]["name"].as_str().expect("缺少接口名")
+    }
+
+    fn randomize_xray(path: &Path) -> Result<(), AppError> {
+        let text = fs::read_to_string(path).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        randomize_xray_tun_name(path, &text, &json)
+    }
+
+    #[test]
+    fn test_sing_box_replaces_existing_interface_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "{\n  \"inbounds\": [\n    {\n      \"type\": \"tun\",\n      \"interface_name\": \"sing-tun\"\n    }\n  ]\n}\n",
+        );
+
+        randomize_sing_box_tun_name(&path).unwrap();
+
+        let name = read_json(&path)["inbounds"][0]["interface_name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(name.starts_with(TUN_PREFIX), "接口名未被随机化: {name}");
+    }
+
+    #[test]
+    fn test_sing_box_inserts_missing_interface_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "{\n  \"inbounds\": [\n    {\n      \"type\": \"tun\",\n      \"tag\": \"in-tun\"\n    }\n  ]\n}\n",
+        );
+
+        randomize_sing_box_tun_name(&path).unwrap();
+
+        let json = read_json(&path);
+        assert!(sing_box_interface_name(&json).starts_with(TUN_PREFIX));
+        // 原有字段不能被破坏
+        assert_eq!(json["inbounds"][0]["tag"], "in-tun");
+    }
+
+    /// 回归: tun 标记位于末行且文件无尾随换行时, 行尾插入会索引越界 panic。
+    #[test]
+    fn test_sing_box_inserts_into_single_line_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "{\"inbounds\": [{\"type\": \"tun\"}]}");
+
+        randomize_sing_box_tun_name(&path).unwrap();
+
+        assert!(sing_box_interface_name(&read_json(&path)).starts_with(TUN_PREFIX));
+    }
+
+    #[test]
+    fn test_sing_box_skips_config_without_tun() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "{\"inbounds\": [{\"type\": \"socks\"}]}";
+        let path = write_config(&dir, original);
+
+        randomize_sing_box_tun_name(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_xray_replaces_existing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "{\n  \"inbounds\": [\n    {\n      \"protocol\": \"tun\",\n      \"settings\": {\n        \"name\": \"xray0\"\n      }\n    }\n  ]\n}\n",
+        );
+
+        randomize_xray(&path).unwrap();
+
+        assert!(xray_tun_name(&read_json(&path)).starts_with(TUN_PREFIX));
+    }
+
+    /// 回归: settings 为空对象时后置逗号会产生尾随逗号, 破坏 JSON。
+    #[test]
+    fn test_xray_inserts_into_empty_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "{\"inbounds\": [{\"protocol\": \"tun\", \"settings\": {}}]}");
+
+        randomize_xray(&path).unwrap();
+
+        assert!(xray_tun_name(&read_json(&path)).starts_with(TUN_PREFIX));
+    }
+
+    #[test]
+    fn test_xray_inserts_into_non_empty_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "{\n  \"inbounds\": [\n    {\n      \"protocol\": \"tun\",\n      \"settings\": {\n        \"mtu\": 1500\n      }\n    }\n  ]\n}\n",
+        );
+
+        randomize_xray(&path).unwrap();
+
+        let json = read_json(&path);
+        assert!(xray_tun_name(&json).starts_with(TUN_PREFIX));
+        assert_eq!(json["inbounds"][0]["settings"]["mtu"], 1500);
+    }
+
+    /// tun inbound 完全没有 settings 字段时, 应插入整个 settings 对象,
+    /// 而不是把 name 写进其他 inbound 的 settings 里。
+    #[test]
+    fn test_xray_inserts_whole_settings_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "{\"inbounds\": [{\"protocol\": \"tun\"}, {\"protocol\": \"socks\", \"settings\": {\"udp\": true}}]}",
+        );
+
+        randomize_xray(&path).unwrap();
+
+        let json = read_json(&path);
+        assert!(xray_tun_name(&json).starts_with(TUN_PREFIX));
+        // 另一个 inbound 的 settings 不能被污染
+        assert_eq!(json["inbounds"][1]["settings"]["udp"], true);
+        assert!(json["inbounds"][1]["settings"]["name"].is_null());
+    }
+
+    #[test]
+    fn test_xray_rejects_non_object_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "{\"inbounds\": [{\"protocol\": \"tun\", \"settings\": []}]}");
+
+        assert!(randomize_xray(&path).is_err());
     }
 }
