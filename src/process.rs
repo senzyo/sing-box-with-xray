@@ -208,7 +208,7 @@ fn kill_processes_by_name(exe_name: &str) {
 /// 规则集更新是否正在进行。
 static RULESET_UPDATING: AtomicBool = AtomicBool::new(false);
 
-/// 规则集更新是否正在进行。
+/// 查询规则集更新标志。
 ///
 /// 供更新核心前的互斥检查使用: 两者都是几十 MB 的下载, 不并行抢带宽。
 pub fn ruleset_updating() -> bool {
@@ -622,6 +622,9 @@ mod tests {
     }
 
     /// 更新核心前的互斥检查读的必须是规则集更新自己用的那个标志。
+    ///
+    /// `RULESET_UPDATING` 是全局状态, 相关断言集中在这一个测试里: 任何别的测试
+    /// 只要间接走到 `spawn_ruleset_update`, 并行执行时就会和这里互相干扰。
     #[test]
     fn test_ruleset_updating_reflects_flag() {
         assert!(!ruleset_updating(), "初始应为空闲");

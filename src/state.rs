@@ -474,6 +474,21 @@ mod tests {
         assert_eq!(Core::Xray.config_dir(base), base.join("configs/xray"));
     }
 
+    /// 可执行文件名在 `exe_name` 和 `artifacts().required` 里各写了一遍, 两处
+    /// 不一致时, 版本检查读的路径就和更新替换的文件对不上: 更新会报"缺少必需
+    /// 文件", 或者换掉一个没人加载的文件。
+    #[test]
+    fn test_artifacts_required_contains_exe() {
+        for core in Core::ALL {
+            assert!(
+                core.artifacts().required.contains(&core.exe_name()),
+                "{} 的 required 不含 {}",
+                core.label(),
+                core.exe_name()
+            );
+        }
+    }
+
     #[test]
     fn test_find_json_configs_sorts_and_filters() {
         let dir = tempfile::tempdir().unwrap();

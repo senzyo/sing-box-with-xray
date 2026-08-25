@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -435,11 +435,40 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// 替换核心文件时给旧文件加的后缀。
 ///
-/// 替换成功后刻意不删: 留一份供回退, 直到下一次更新开始时才清理。
+/// 替换成功后刻意不删: 留一份供回退, 直到下一次更新确认可以替换时才清理。
 const OLD_SUFFIX: &str = "old";
 
 /// 解压过程中给新文件加的后缀。
 const NEW_SUFFIX: &str = "new";
+
+/// 改名的总尝试次数 (含第一次) 。
+///
+/// 刚落地的文件立刻要改名, 而杀软实时扫描、索引器、同步盘, 以及还没完全退出
+/// 的核心进程 (`TerminateProcess` 是异步的) 都可能短暂持有句柄, 让改名以共享
+/// 冲突失败。这类占用是毫秒级的, 重试几次就能过去。
+const RENAME_ATTEMPTS: u32 = 10;
+
+/// 改名重试的间隔。
+const RENAME_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+/// 带重试的改名。
+///
+/// 源文件不存在时立即返回: 那不是占用问题, 等下去也不会好转。
+fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    for attempt in 1..RENAME_ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(e),
+            Err(e) => debug!(
+                "改名失败 (第 {attempt}/{RENAME_ATTEMPTS} 次) {} -> {}: {e}",
+                from.display(),
+                to.display()
+            ),
+        }
+        std::thread::sleep(RENAME_RETRY_DELAY);
+    }
+    fs::rename(from, to)
+}
 
 /// 从 zip 中提取核心运行所需的文件, 核心目录里的其他内容保持不动。
 ///
@@ -447,12 +476,14 @@ const NEW_SUFFIX: &str = "new";
 /// 配置的规则集 dat, 也会丢掉 sing-box 运行时生成的 cache.db。
 ///
 /// 流程:
-/// 1. 清理上一次更新留下的 `.old`, 以及可能残留的 `.new`
+/// 1. 清理可能残留的 `.new`
 /// 2. 按文件名匹配清单, 命中的先解压成 `{name}.new`
 /// 3. `required` 有缺失就清掉 `.new` 并报错, 核心目录保持原状
-/// 4. 逐个替换: 旧文件改名成 `{name}.old`, 再把 `{name}.new` 改名到位
+/// 4. 确认可以替换后, 才清理上一次更新留下的 `.old`
+/// 5. 逐个替换: 旧文件改名成 `{name}.old`, 再把 `{name}.new` 改名到位,
+///    中途失败则把本轮已改名的 `.old` 恢复回去
 ///
-/// 第 4 步先挪开再放新的, 而不是直接覆盖: Windows 允许改名正在运行的 exe,
+/// 第 5 步先挪开再放新的, 而不是直接覆盖: Windows 允许改名正在运行的 exe,
 /// 却不允许覆盖它, 而 `TerminateProcess` 是异步的, `stop_all` 返回时进程
 /// 可能还没完全退出。
 ///
@@ -461,7 +492,6 @@ const NEW_SUFFIX: &str = "new";
 /// 所有条目都会被静默跳过 —— 更新"成功"却一个文件也没换。
 fn extract_artifacts(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts) -> Result<(), AppError> {
     fs::create_dir_all(core_dir).map_err(|e| AppError::Msg(format!("创建核心目录失败: {e}")))?;
-    remove_suffixed(core_dir, artifacts, OLD_SUFFIX);
     remove_suffixed(core_dir, artifacts, NEW_SUFFIX);
 
     match stage_and_replace(zip_path, core_dir, artifacts) {
@@ -474,6 +504,8 @@ fn extract_artifacts(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts
 }
 
 /// 解压到 `.new` 并逐个替换到位, 失败时由调用方清理 `.new`。
+///
+/// 替换中途失败会先回滚已改名的旧文件, 再把错误返回给调用方。
 fn stage_and_replace(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts) -> Result<(), AppError> {
     let file = fs::File::open(zip_path).map_err(|e| AppError::Msg(format!("打开 zip 文件失败: {e}")))?;
     let reader = BufReader::new(file);
@@ -527,18 +559,70 @@ fn stage_and_replace(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts
         }
     }
 
+    // 清理上一轮的 `.old` 刻意放在这里, 而不是解压之前: 上面任何一步失败都会
+    // 让本次更新作罢, 那时上一轮的 `.old` 是用户唯一的回退副本, 不该被清掉。
+    remove_suffixed(core_dir, artifacts, OLD_SUFFIX);
+
+    // 本轮已改名成 `.old` 的文件, 中途失败时按相反顺序恢复
+    let mut renamed: Vec<(&str, PathBuf)> = Vec::new();
+
     for name in &staged {
         let dest = core_dir.join(name);
         if dest.exists() {
             let old = core_dir.join(format!("{name}.{OLD_SUFFIX}"));
-            fs::rename(&dest, &old).map_err(|e| AppError::Msg(format!("备份 {name} 失败: {e}")))?;
+            if let Err(e) = rename_with_retry(&dest, &old) {
+                return Err(replace_failed(core_dir, &renamed, name, "备份", &e));
+            }
+            renamed.push((name.as_str(), old));
         }
         let tmp_path = core_dir.join(format!("{name}.{NEW_SUFFIX}"));
-        fs::rename(&tmp_path, &dest).map_err(|e| AppError::Msg(format!("替换 {name} 失败: {e}")))?;
+        if let Err(e) = rename_with_retry(&tmp_path, &dest) {
+            return Err(replace_failed(core_dir, &renamed, name, "替换", &e));
+        }
         info!("已更新 {name}");
     }
 
     Ok(())
+}
+
+/// 替换中途失败时先回滚, 再组装错误信息。
+///
+/// 失败点如果落在"旧文件已挪走、新文件还没到位"之间, 核心目录里就没有可用的
+/// 核心文件了, 界面上会显示成未安装。所以必须把已挪走的旧文件放回去; 万一连
+/// 恢复都失败, 错误信息要指名道姓地给出需要手工处理的路径, 而不是只说一句
+/// "更新失败"。
+fn replace_failed(core_dir: &Path, renamed: &[(&str, PathBuf)], name: &str, action: &str, err: &io::Error) -> AppError {
+    let unrecovered = rollback(core_dir, renamed);
+    if unrecovered.is_empty() {
+        return AppError::Msg(format!("{action} {name} 失败: {err} (已恢复到更新前的版本)"));
+    }
+
+    let paths: Vec<String> = unrecovered
+        .iter()
+        .map(|n| core_dir.join(format!("{n}.{OLD_SUFFIX}")).display().to_string())
+        .collect();
+    AppError::Msg(format!(
+        "{action} {name} 失败: {err}; 以下文件未能自动恢复, 请手动去掉 .{OLD_SUFFIX} 后缀: {}",
+        paths.join(", ")
+    ))
+}
+
+/// 把本轮已改名成 `.old` 的文件恢复回原名, 返回未能恢复的文件名。
+///
+/// 按与替换相反的顺序恢复。已经换成新版的文件也会被还原, 因此回滚成功后整个
+/// 核心目录回到更新前的状态, 不会留下版本错配的组合。
+fn rollback(core_dir: &Path, renamed: &[(&str, PathBuf)]) -> Vec<String> {
+    let mut unrecovered = Vec::new();
+    for (name, old) in renamed.iter().rev() {
+        match rename_with_retry(old, &core_dir.join(name)) {
+            Ok(()) => info!("已恢复 {name}"),
+            Err(e) => {
+                error!("恢复 {name} 失败: {e}");
+                unrecovered.push((*name).to_string());
+            }
+        }
+    }
+    unrecovered
 }
 
 /// 删除清单内文件的指定后缀副本。
@@ -955,6 +1039,96 @@ mod tests {
             "必需文件缺失时不应替换任何文件"
         );
         assert!(!core_dir.join("extra.dll.new").exists(), "失败后应清理临时文件");
+    }
+
+    /// 本次更新失败时, 上一轮的 `.old` 是用户唯一的回退副本, 不能被清掉。
+    #[test]
+    fn test_extract_artifacts_missing_required_keeps_old_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(&zip_path, &[("extra.dll", &b"dll"[..])]);
+        let core_dir = dir.path().join("core");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(core_dir.join("core.exe"), b"current").unwrap();
+        fs::write(core_dir.join("core.exe.old"), b"prev").unwrap();
+
+        extract(&zip_path, &core_dir).unwrap_err();
+
+        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "current");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe.old")).unwrap(),
+            "prev",
+            "更新没成功就不该清掉上一轮的回退副本"
+        );
+    }
+
+    /// 替换中途失败时, 已经挪走的旧文件必须回到原位, 否则核心目录里会缺文件,
+    /// 界面上表现为"未安装"。
+    #[test]
+    fn test_rollback_restores_renamed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let core_dir = dir.path();
+        fs::write(core_dir.join("core.exe.old"), b"old-exe").unwrap();
+        fs::write(core_dir.join("extra.dll.old"), b"old-dll").unwrap();
+        // extra.dll 已经换成新版, 回滚要把它一起还原, 不留版本错配的组合
+        fs::write(core_dir.join("extra.dll"), b"new-dll").unwrap();
+
+        let renamed = [
+            ("extra.dll", core_dir.join("extra.dll.old")),
+            ("core.exe", core_dir.join("core.exe.old")),
+        ];
+        assert!(rollback(core_dir, &renamed).is_empty(), "应全部恢复成功");
+
+        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "old-exe");
+        assert_eq!(fs::read_to_string(core_dir.join("extra.dll")).unwrap(), "old-dll");
+        assert!(!core_dir.join("core.exe.old").exists());
+        assert!(!core_dir.join("extra.dll.old").exists());
+    }
+
+    /// 恢复失败的文件名必须报告出去, 错误信息靠它提示用户手动处理。
+    #[test]
+    fn test_rollback_reports_unrecovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let core_dir = dir.path();
+        let renamed = [("missing.exe", core_dir.join("missing.exe.old"))];
+
+        assert_eq!(rollback(core_dir, &renamed), ["missing.exe".to_string()]);
+    }
+
+    /// 端到端覆盖回滚: 后一个文件替换失败时, 前一个必须还原, 核心目录整体回到
+    /// 更新前的状态, 不留下"新 exe + 旧 dll"的组合。
+    ///
+    /// 用目录占住改名的目标来制造失败: Windows 上 MoveFileEx 只能覆盖文件, 目标
+    /// 是已存在的目录时必定失败。真实场景里对应的是句柄占用, 但那要绕过 std 的
+    /// 共享标志自己 CreateFileW, 而这里只关心失败之后的恢复行为。
+    ///
+    /// 这个用例会走满改名重试, 因此比其他用例慢几秒。
+    #[test]
+    fn test_extract_artifacts_rolls_back_when_replace_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(
+            &zip_path,
+            &[("core.exe", &b"new-exe"[..]), ("extra.dll", &b"new-dll"[..])],
+        );
+        let core_dir = dir.path().join("core");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(core_dir.join("core.exe"), b"old-exe").unwrap();
+        fs::write(core_dir.join("extra.dll"), b"old-dll").unwrap();
+        fs::create_dir_all(core_dir.join(format!("extra.dll.{OLD_SUFFIX}"))).unwrap();
+
+        let err = extract(&zip_path, &core_dir).unwrap_err();
+        assert!(err.to_string().contains("extra.dll"), "错误应指出哪个文件失败: {err}");
+        assert!(err.to_string().contains("已恢复"), "回滚成功后要告知用户: {err}");
+
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            "old-exe",
+            "已经换成新版的文件必须还原"
+        );
+        assert_eq!(fs::read_to_string(core_dir.join("extra.dll")).unwrap(), "old-dll");
+        assert!(!core_dir.join(format!("core.exe.{NEW_SUFFIX}")).exists());
+        assert!(!core_dir.join(format!("extra.dll.{NEW_SUFFIX}")).exists());
     }
 
     #[test]
