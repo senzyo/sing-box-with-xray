@@ -38,6 +38,10 @@ pub enum ProcessState {
     Running,
 }
 
+/// 两个核心的可执行文件名。顺序与 `CoreStates` 的字段一致, `core_states`
+/// 依赖这个顺序解构 `running_flags` 的返回值。
+pub const CORE_EXE_NAMES: [&str; 2] = ["sing-box.exe", "xray.exe"];
+
 /// 全局应用状态。
 pub struct AppState {
     /// 可执行文件所在目录, 所有相对路径以此为基准。
@@ -146,49 +150,19 @@ pub fn find_json_configs(dirs: &[PathBuf]) -> Vec<PathBuf> {
     paths
 }
 
-/// 通过 Win32 ToolHelp API 枚举所有与 `exe_name` 匹配的进程, 返回 PID 列表。
-pub fn find_pids_by_name(exe_name: &str) -> Vec<u32> {
-    let mut pids = Vec::new();
+/// 遍历系统进程快照, 对每个进程调用 `visit(进程名, PID)`。
+///
+/// `visit` 返回 `false` 时提前结束遍历。
+fn for_each_process(mut visit: impl FnMut(&str, u32) -> bool) {
     unsafe {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             warn!("CreateToolhelp32Snapshot 失败, 无法枚举进程");
-            return pids;
+            return;
         };
 
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
-            loop {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let name_bytes = &entry.szExeFile[..end];
-                let name = String::from_utf16_lossy(name_bytes);
-                if name.eq_ignore_ascii_case(exe_name) {
-                    pids.push(entry.th32ProcessID);
-                }
-                if Process32NextW(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-
-        let _ = CloseHandle(snapshot);
-    }
-    pids
-}
-
-/// 检查指定名称的进程是否正在运行 (找到第一个即返回) 。
-pub fn is_process_running(exe_name: &str) -> bool {
-    unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return false;
-        };
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
                 let end = entry
@@ -197,41 +171,81 @@ pub fn is_process_running(exe_name: &str) -> bool {
                     .position(|&c| c == 0)
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                if name.eq_ignore_ascii_case(exe_name) {
-                    let _ = CloseHandle(snapshot);
-                    return true;
+                if !visit(&name, entry.th32ProcessID) {
+                    break;
                 }
                 if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
                 }
             }
         }
+
         let _ = CloseHandle(snapshot);
     }
-    false
 }
 
-/// 查询 sing-box 进程运行状态。
-pub fn sing_box_state(app: &AppState) -> ProcessState {
-    if !app.exe_dir.join("sing-box_core").join("sing-box.exe").exists() {
-        return ProcessState::NotInstalled;
-    }
-    if is_process_running("sing-box.exe") {
-        ProcessState::Running
+/// 通过 Win32 ToolHelp API 枚举所有与 `exe_name` 匹配的进程, 返回 PID 列表。
+pub fn find_pids_by_name(exe_name: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for_each_process(|name, pid| {
+        if name.eq_ignore_ascii_case(exe_name) {
+            pids.push(pid);
+        }
+        true
+    });
+    pids
+}
+
+/// 一次进程快照判断 `names` 中每个名字是否有进程在运行, 返回值与入参同序。
+///
+/// 每个名字单独枚举一遍是纯粹的浪费: CreateToolhelp32Snapshot 要复制整张
+/// 进程表, 进程多的机器上单次就要几十毫秒。全部命中后提前结束遍历。
+pub fn running_flags<const N: usize>(names: &[&str; N]) -> [bool; N] {
+    let mut found = [false; N];
+    for_each_process(|name, _| {
+        for (flag, target) in found.iter_mut().zip(names) {
+            if !*flag && name.eq_ignore_ascii_case(target) {
+                *flag = true;
+            }
+        }
+        !found.iter().all(|f| *f)
+    });
+    found
+}
+
+/// 两个核心的安装与运行状态。
+pub struct CoreStates {
+    pub sing_box: ProcessState,
+    pub xray: ProcessState,
+}
+
+/// 查询两个核心的安装与运行状态。
+///
+/// 刻意接收 `exe_dir` 而不是 `&AppState`: 进程枚举和文件存在性检查都是几十
+/// 毫秒级的系统调用, 调用方应当先从 Mutex 里复制出 exe_dir、释放锁, 再调用
+/// 本函数, 否则打开托盘菜单期间会一直持锁, 阻塞需要写状态的后台线程。
+pub fn core_states(exe_dir: &Path) -> CoreStates {
+    let sing_box_installed = exe_dir.join("sing-box_core").join("sing-box.exe").exists();
+    let xray_installed = exe_dir.join("xray_core").join("xray.exe").exists();
+
+    // 两个核心都没装就不必枚举进程
+    let [sing_box_running, xray_running] = if sing_box_installed || xray_installed {
+        running_flags(&CORE_EXE_NAMES)
     } else {
-        ProcessState::NotRunning
+        [false; 2]
+    };
+
+    CoreStates {
+        sing_box: process_state(sing_box_installed, sing_box_running),
+        xray: process_state(xray_installed, xray_running),
     }
 }
 
-/// 查询 xray 进程运行状态。
-pub fn xray_state(app: &AppState) -> ProcessState {
-    if !app.exe_dir.join("xray_core").join("xray.exe").exists() {
-        return ProcessState::NotInstalled;
-    }
-    if is_process_running("xray.exe") {
-        ProcessState::Running
-    } else {
-        ProcessState::NotRunning
+fn process_state(installed: bool, running: bool) -> ProcessState {
+    match (installed, running) {
+        (false, _) => ProcessState::NotInstalled,
+        (true, true) => ProcessState::Running,
+        (true, false) => ProcessState::NotRunning,
     }
 }
 
@@ -270,5 +284,44 @@ mod tests {
         assert!(FlagGuard::acquire(&FLAG).is_none(), "已占用时不应重复获取");
         drop(guard);
         assert!(FlagGuard::acquire(&FLAG).is_some(), "释放后应能重新获取");
+    }
+
+    /// 用测试进程自己做样本, 不依赖环境里存在某个特定进程。
+    fn current_exe_name() -> String {
+        std::env::current_exe()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn test_running_flags_matches_by_name() {
+        let name = current_exe_name();
+        let [found, missing] = running_flags(&[name.as_str(), "绝对不存在的进程-zzz.exe"]);
+        assert!(found, "当前进程 {name} 应被检测到");
+        assert!(!missing, "不存在的进程名不应被检测到");
+    }
+
+    #[test]
+    fn test_running_flags_ignores_case() {
+        let upper = current_exe_name().to_uppercase();
+        let [found] = running_flags(&[upper.as_str()]);
+        assert!(found, "进程名匹配应当大小写不敏感");
+    }
+
+    #[test]
+    fn test_find_pids_by_name_includes_self() {
+        let pids = find_pids_by_name(&current_exe_name());
+        assert!(pids.contains(&std::process::id()), "应包含当前进程 PID");
+    }
+
+    #[test]
+    fn test_process_state_mapping() {
+        assert!(matches!(process_state(false, false), ProcessState::NotInstalled));
+        assert!(matches!(process_state(false, true), ProcessState::NotInstalled));
+        assert!(matches!(process_state(true, false), ProcessState::NotRunning));
+        assert!(matches!(process_state(true, true), ProcessState::Running));
     }
 }

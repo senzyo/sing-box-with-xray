@@ -140,12 +140,9 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
 // 进程停止
 // ═══════════════════════════════════════════════
 
-/// 两个核心的可执行文件名。
-pub const CORE_EXE_NAMES: &[&str] = &["sing-box.exe", "xray.exe"];
-
 /// 终止所有已知子进程并刷新 DNS。
 pub fn stop_all() -> Result<(), AppError> {
-    stop_processes(CORE_EXE_NAMES)
+    stop_processes(&state::CORE_EXE_NAMES)
 }
 
 /// 按进程名终止两个核心并恢复网络状态, 全程不触碰 `AppState`。
@@ -154,7 +151,7 @@ pub fn stop_all() -> Result<(), AppError> {
 /// panic 完全可能发生在持锁期间, 此时再取同一把锁就是自死锁。这里跳过 Child
 /// 句柄, 只按名字终止, 因此不存在这个风险。
 pub fn kill_cores_without_state() {
-    for name in CORE_EXE_NAMES {
+    for name in state::CORE_EXE_NAMES {
         kill_processes_by_name(name);
     }
     dns::restore_dns_to_dhcp();

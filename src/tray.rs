@@ -316,14 +316,12 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 /// 避免模态消息循环重入窗口过程时因 Mutex 不可重入导致死锁。
 unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
     unsafe {
-        let (sing_state, xray_state, exe_dir, icon_green, icon_yellow, icon_red, core_mode) = {
+        let (exe_dir, icon_green, icon_yellow, icon_red, core_mode) = {
             let app = match state::app_state() {
                 Some(app) => app,
                 None => return (0, HashMap::new()),
             };
             (
-                state::sing_box_state(&app),
-                state::xray_state(&app),
                 app.exe_dir.clone(),
                 app.icon_green,
                 app.icon_yellow,
@@ -331,6 +329,10 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
                 app.settings.core.mode,
             )
         };
+
+        // 锁已释放才做状态查询: 进程快照和文件存在性检查都是几十毫秒级的
+        // 系统调用, 放在锁内会阻塞需要写状态的后台线程。
+        let states = state::core_states(&exe_dir);
 
         let Ok(menu) = CreatePopupMenu() else {
             return (0, HashMap::new());
@@ -349,10 +351,14 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
 
         // ── 状态项: 仅显示已启用核心 ──
         if core_mode.runs_sing_box() {
-            append_status_item(menu, &status_label(sing_state, "sing-box"), status_hbmp(sing_state));
+            append_status_item(
+                menu,
+                &status_label(states.sing_box, "sing-box"),
+                status_hbmp(states.sing_box),
+            );
         }
         if core_mode.runs_xray() {
-            append_status_item(menu, &status_label(xray_state, "xray"), status_hbmp(xray_state));
+            append_status_item(menu, &status_label(states.xray, "xray"), status_hbmp(states.xray));
         }
         append_separator(menu);
 
