@@ -9,12 +9,12 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::error::AppError;
-use crate::state::Core;
+use crate::state::{Core, CoreArtifacts};
 
 /// GitHub API 要求的 User-Agent 头, 缺少会返回 403。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
@@ -120,9 +120,8 @@ pub fn update_sing_box(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, del
         return Ok(());
     }
 
-    let core_dir = Core::SingBox.core_dir(exe_dir);
-    let nested_prefix = format!("sing-box-{}-windows-{}/", remote_ver, SINGBOX_ARCH_SUFFIX);
-    backup_and_extract(&zip_path, &core_dir, Some(&nested_prefix))?;
+    let core = Core::SingBox;
+    extract_artifacts(&zip_path, &core.core_dir(exe_dir), &core.artifacts())?;
 
     let _ = fs::remove_file(&zip_path);
     info!("[sing-box] 更新完成 -> v{remote_ver}");
@@ -170,8 +169,8 @@ pub fn update_xray(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_s
         return Ok(());
     }
 
-    let core_dir = Core::Xray.core_dir(exe_dir);
-    backup_and_extract(&zip_path, &core_dir, None)?;
+    let core = Core::Xray;
+    extract_artifacts(&zip_path, &core.core_dir(exe_dir), &core.artifacts())?;
 
     let _ = fs::remove_file(&zip_path);
     info!("[xray] 更新完成 -> v{remote_ver}");
@@ -434,74 +433,126 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// 备份核心目录并从 zip 解压全部内容。
+/// 替换核心文件时给旧文件加的后缀。
 ///
-/// 1. 删除 `{core_dir}_backup` (如存在)
-/// 2. 重命名 `{core_dir}` → `{core_dir}_backup`
-/// 3. 解压 zip 全部内容到 `{core_dir}`
+/// 替换成功后刻意不删: 留一份供回退, 直到下一次更新开始时才清理。
+const OLD_SUFFIX: &str = "old";
+
+/// 解压过程中给新文件加的后缀。
+const NEW_SUFFIX: &str = "new";
+
+/// 从 zip 中提取核心运行所需的文件, 核心目录里的其他内容保持不动。
 ///
-/// `strip_prefix` 为 Some 时, 跳过 zip 中以此开头的顶层目录 (用于 sing-box 的嵌套目录结构) 。
-fn backup_and_extract(zip_path: &Path, core_dir: &Path, strip_prefix: Option<&str>) -> Result<(), AppError> {
-    let backup_dir = PathBuf::from(format!("{}_backup", core_dir.display()));
-
-    if backup_dir.exists() {
-        debug!("删除旧备份: {}", backup_dir.display());
-        fs::remove_dir_all(&backup_dir).map_err(|e| AppError::Msg(format!("删除旧备份失败: {e}")))?;
-    }
-
-    if core_dir.exists() {
-        debug!("备份: {} -> {}", core_dir.display(), backup_dir.display());
-        fs::rename(core_dir, &backup_dir).map_err(|e| AppError::Msg(format!("备份目录失败: {e}")))?;
-    }
-
+/// 不再整体替换核心目录, 原因见 `CoreArtifacts` 的说明 —— 那样会盖掉用户
+/// 配置的规则集 dat, 也会丢掉 sing-box 运行时生成的 cache.db。
+///
+/// 流程:
+/// 1. 清理上一次更新留下的 `.old`, 以及可能残留的 `.new`
+/// 2. 按文件名匹配清单, 命中的先解压成 `{name}.new`
+/// 3. `required` 有缺失就清掉 `.new` 并报错, 核心目录保持原状
+/// 4. 逐个替换: 旧文件改名成 `{name}.old`, 再把 `{name}.new` 改名到位
+///
+/// 第 4 步先挪开再放新的, 而不是直接覆盖: Windows 允许改名正在运行的 exe,
+/// 却不允许覆盖它, 而 `TerminateProcess` 是异步的, `stop_all` 返回时进程
+/// 可能还没完全退出。
+///
+/// 按文件名匹配而不是按 zip 内路径: sing-box 的包有一层带版本号的顶层目录,
+/// 原先靠拼 `sing-box-{ver}-windows-{arch}/` 前缀剥离, 官方一旦改了命名规则,
+/// 所有条目都会被静默跳过 —— 更新"成功"却一个文件也没换。
+fn extract_artifacts(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts) -> Result<(), AppError> {
     fs::create_dir_all(core_dir).map_err(|e| AppError::Msg(format!("创建核心目录失败: {e}")))?;
+    remove_suffixed(core_dir, artifacts, OLD_SUFFIX);
+    remove_suffixed(core_dir, artifacts, NEW_SUFFIX);
 
+    match stage_and_replace(zip_path, core_dir, artifacts) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            remove_suffixed(core_dir, artifacts, NEW_SUFFIX);
+            Err(e)
+        }
+    }
+}
+
+/// 解压到 `.new` 并逐个替换到位, 失败时由调用方清理 `.new`。
+fn stage_and_replace(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts) -> Result<(), AppError> {
     let file = fs::File::open(zip_path).map_err(|e| AppError::Msg(format!("打开 zip 文件失败: {e}")))?;
     let reader = BufReader::new(file);
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| AppError::Msg(format!("解析 zip 文件失败: {e}")))?;
+
+    let mut staged: Vec<String> = Vec::new();
 
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| AppError::Msg(format!("读取 zip 条目失败: {e}")))?;
 
-        // enclosed_name 会拒绝绝对路径、含 NULL 字节, 以及用 .. 逃出目标目录的条目。
-        //
-        // 不能改回 name() 自行拼接后用 starts_with 判断: Path::starts_with 是按
-        // 组件的词法比较, 不解析 .., 因此 core_dir/../evil 会被判定为 core_dir
-        // 的子路径, 检查形同虚设。
+        if entry.is_dir() {
+            continue;
+        }
+
+        // enclosed_name 会拒绝绝对路径、含 NULL 字节, 以及用 .. 逃出目标目录的
+        // 条目。不能改用 name() 自行拼接后 starts_with 判断: Path::starts_with
+        // 是按组件的词法比较、不解析 .., core_dir/../evil 会被判定为子路径。
         let Some(entry_path) = entry.enclosed_name() else {
             warn!("zip 条目路径不安全, 跳过: {}", entry.name());
             continue;
         };
 
-        let rel_path = match strip_prefix {
-            Some(prefix) => match entry_path.strip_prefix(prefix) {
-                Ok(rest) => rest.to_path_buf(),
-                Err(_) => continue,
-            },
-            None => entry_path,
+        let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
         };
-
-        if rel_path.as_os_str().is_empty() {
+        if !artifacts.wants(name) {
+            continue;
+        }
+        if staged.iter().any(|s| s == name) {
+            warn!("zip 中存在重名文件 {name}, 忽略后一个");
             continue;
         }
 
-        let out_path = core_dir.join(&rel_path);
+        let tmp_path = core_dir.join(format!("{name}.{NEW_SUFFIX}"));
+        let mut out = fs::File::create(&tmp_path).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
+        io::copy(&mut entry, &mut out).map_err(|e| AppError::Msg(format!("解压文件失败: {e}")))?;
+        debug!("已解压 {name} -> {}", tmp_path.display());
+        staged.push(name.to_string());
+    }
 
-        if entry.is_dir() {
-            fs::create_dir_all(&out_path).map_err(|e| AppError::Msg(format!("创建目录失败: {e}")))?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| AppError::Msg(format!("创建父目录失败: {e}")))?;
-            }
-            let mut out = fs::File::create(&out_path).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
-            io::copy(&mut entry, &mut out).map_err(|e| AppError::Msg(format!("解压文件失败: {e}")))?;
+    for name in artifacts.required {
+        if !staged.iter().any(|s| s == name) {
+            return Err(AppError::Msg(format!("zip 中缺少必需文件: {name}")));
+        }
+    }
+    for name in artifacts.optional {
+        if !staged.iter().any(|s| s == name) {
+            warn!("zip 中未找到 {name}, 本次不更新该文件");
         }
     }
 
-    debug!("解压完成: {} -> {}", zip_path.display(), core_dir.display());
+    for name in &staged {
+        let dest = core_dir.join(name);
+        if dest.exists() {
+            let old = core_dir.join(format!("{name}.{OLD_SUFFIX}"));
+            fs::rename(&dest, &old).map_err(|e| AppError::Msg(format!("备份 {name} 失败: {e}")))?;
+        }
+        let tmp_path = core_dir.join(format!("{name}.{NEW_SUFFIX}"));
+        fs::rename(&tmp_path, &dest).map_err(|e| AppError::Msg(format!("替换 {name} 失败: {e}")))?;
+        info!("已更新 {name}");
+    }
+
     Ok(())
+}
+
+/// 删除清单内文件的指定后缀副本。
+fn remove_suffixed(core_dir: &Path, artifacts: &CoreArtifacts, suffix: &str) {
+    for name in artifacts.required.iter().chain(artifacts.optional) {
+        let path = core_dir.join(format!("{name}.{suffix}"));
+        if !path.exists() {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => debug!("已清理 {}", path.display()),
+            Err(e) => warn!("清理 {} 失败: {e}", path.display()),
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════
@@ -782,92 +833,184 @@ mod tests {
         zip.finish().unwrap();
     }
 
-    #[test]
-    fn test_backup_and_extract_no_strip_prefix() {
-        let dir = tempfile::tempdir().unwrap();
-        let zip_path = dir.path().join("core.zip");
-        write_test_zip(&zip_path, &[("a.txt", &b"hello"[..]), ("sub/b.txt", &b"world"[..])]);
-        let core_dir = dir.path().join("core");
+    /// 测试用的提取清单, 结构与真实核心一致: 一个必需 exe 加一个可选 dll。
+    const TEST_ARTIFACTS: CoreArtifacts = CoreArtifacts {
+        required: &["core.exe"],
+        optional: &["extra.dll"],
+    };
 
-        backup_and_extract(&zip_path, &core_dir, None).unwrap();
-
-        assert_eq!(fs::read_to_string(core_dir.join("a.txt")).unwrap(), "hello");
-        assert_eq!(fs::read_to_string(core_dir.join("sub/b.txt")).unwrap(), "world");
+    fn extract(zip_path: &Path, core_dir: &Path) -> Result<(), AppError> {
+        extract_artifacts(zip_path, core_dir, &TEST_ARTIFACTS)
     }
 
     #[test]
-    fn test_backup_and_extract_strip_prefix() {
+    fn test_extract_artifacts_only_takes_wanted_files() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("core.zip");
         write_test_zip(
             &zip_path,
             &[
-                ("sing-box-1.2.3-windows-amd64/sing-box.exe", &b"exe"[..]),
-                ("sing-box-1.2.3-windows-amd64/sub/file.txt", &b"data"[..]),
+                ("core.exe", &b"exe"[..]),
+                ("extra.dll", &b"dll"[..]),
+                ("geoip.dat", &b"official"[..]),
+                ("LICENSE", &b"license"[..]),
+                ("README.md", &b"readme"[..]),
             ],
         );
         let core_dir = dir.path().join("core");
 
-        backup_and_extract(&zip_path, &core_dir, Some("sing-box-1.2.3-windows-amd64/")).unwrap();
+        extract(&zip_path, &core_dir).unwrap();
 
-        assert_eq!(fs::read_to_string(core_dir.join("sing-box.exe")).unwrap(), "exe");
-        assert_eq!(fs::read_to_string(core_dir.join("sub/file.txt")).unwrap(), "data");
-        assert!(!core_dir.join("sing-box-1.2.3-windows-amd64").exists());
+        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "exe");
+        assert_eq!(fs::read_to_string(core_dir.join("extra.dll")).unwrap(), "dll");
+        for unwanted in ["geoip.dat", "LICENSE", "README.md"] {
+            assert!(!core_dir.join(unwanted).exists(), "{unwanted} 不该被提取");
+        }
     }
 
-    /// 路径穿越条目必须被跳过, 不能写到 core_dir 之外。
+    /// 整件事的目的: 用户自己配置的规则集 dat 和运行时生成的文件必须留下。
     #[test]
-    fn test_backup_and_extract_rejects_path_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        let zip_path = dir.path().join("core.zip");
-        write_test_zip(&zip_path, &[("../evil.txt", &b"pwned"[..]), ("good.txt", &b"ok"[..])]);
-        let core_dir = dir.path().join("core");
-
-        backup_and_extract(&zip_path, &core_dir, None).unwrap();
-
-        assert_eq!(fs::read_to_string(core_dir.join("good.txt")).unwrap(), "ok");
-        assert!(
-            !dir.path().join("evil.txt").exists(),
-            "路径穿越条目被写到了 core_dir 之外"
-        );
-    }
-
-    /// 剥离顶层目录时, 穿越到目标目录之外的条目同样必须被跳过。
-    #[test]
-    fn test_backup_and_extract_rejects_traversal_with_strip_prefix() {
+    fn test_extract_artifacts_keeps_existing_files() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("core.zip");
         write_test_zip(
             &zip_path,
-            &[
-                ("sing-box-1.2.3-windows-amd64/sing-box.exe", &b"exe"[..]),
-                ("sing-box-1.2.3-windows-amd64/../../evil.txt", &b"pwned"[..]),
-            ],
+            &[("core.exe", &b"new-exe"[..]), ("geoip.dat", &b"official"[..])],
         );
-        let core_dir = dir.path().join("core");
-
-        backup_and_extract(&zip_path, &core_dir, Some("sing-box-1.2.3-windows-amd64/")).unwrap();
-
-        assert_eq!(fs::read_to_string(core_dir.join("sing-box.exe")).unwrap(), "exe");
-        assert!(!dir.path().join("evil.txt").exists());
-        assert!(!dir.path().parent().unwrap().join("evil.txt").exists());
-    }
-
-    #[test]
-    fn test_backup_and_extract_backs_up_existing() {
-        let dir = tempfile::tempdir().unwrap();
-        let zip_path = dir.path().join("core.zip");
-        write_test_zip(&zip_path, &[("new.txt", &b"new"[..])]);
         let core_dir = dir.path().join("core");
         fs::create_dir_all(&core_dir).unwrap();
-        fs::write(core_dir.join("old.txt"), b"old").unwrap();
+        fs::write(core_dir.join("geoip.dat"), b"user-custom").unwrap();
+        fs::write(core_dir.join("cache.db"), b"runtime").unwrap();
 
-        backup_and_extract(&zip_path, &core_dir, None).unwrap();
+        extract(&zip_path, &core_dir).unwrap();
 
-        assert_eq!(fs::read_to_string(core_dir.join("new.txt")).unwrap(), "new");
-        assert!(!core_dir.join("old.txt").exists());
+        assert_eq!(
+            fs::read_to_string(core_dir.join("geoip.dat")).unwrap(),
+            "user-custom",
+            "用户配置的规则集被官方版覆盖了"
+        );
+        assert_eq!(fs::read_to_string(core_dir.join("cache.db")).unwrap(), "runtime");
+    }
 
-        let backup_dir = dir.path().join("core_backup");
-        assert_eq!(fs::read_to_string(backup_dir.join("old.txt")).unwrap(), "old");
+    #[test]
+    fn test_extract_artifacts_keeps_replaced_file_as_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(&zip_path, &[("core.exe", &b"new-exe"[..])]);
+        let core_dir = dir.path().join("core");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(core_dir.join("core.exe"), b"old-exe").unwrap();
+
+        extract(&zip_path, &core_dir).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "new-exe");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe.old")).unwrap(),
+            "old-exe",
+            "旧文件应保留为 .old 供回退"
+        );
+        assert!(!core_dir.join("core.exe.new").exists(), "临时文件应已改名到位");
+    }
+
+    /// `.old` 留到下一次更新开始时才清理, `.new` 残留也一并清掉。
+    #[test]
+    fn test_extract_artifacts_clears_leftovers_on_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(&zip_path, &[("core.exe", &b"v3"[..])]);
+        let core_dir = dir.path().join("core");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(core_dir.join("core.exe"), b"v2").unwrap();
+        fs::write(core_dir.join("core.exe.old"), b"v1").unwrap();
+        fs::write(core_dir.join("extra.dll.new"), b"stale").unwrap();
+
+        extract(&zip_path, &core_dir).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "v3");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe.old")).unwrap(),
+            "v2",
+            ".old 应是本次被替换的版本, 不是上一轮的"
+        );
+        assert!(!core_dir.join("extra.dll.new").exists(), "残留的 .new 应被清理");
+    }
+
+    #[test]
+    fn test_extract_artifacts_missing_required_keeps_core_dir_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(&zip_path, &[("extra.dll", &b"dll"[..]), ("README.md", &b"readme"[..])]);
+        let core_dir = dir.path().join("core");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(core_dir.join("core.exe"), b"current").unwrap();
+        fs::write(core_dir.join("extra.dll"), b"current-dll").unwrap();
+
+        let err = extract(&zip_path, &core_dir).unwrap_err();
+        assert!(err.to_string().contains("core.exe"), "错误应指出缺哪个文件: {err}");
+
+        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "current");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            "current-dll",
+            "必需文件缺失时不应替换任何文件"
+        );
+        assert!(!core_dir.join("extra.dll.new").exists(), "失败后应清理临时文件");
+    }
+
+    #[test]
+    fn test_extract_artifacts_missing_optional_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(&zip_path, &[("core.exe", &b"exe"[..])]);
+        let core_dir = dir.path().join("core");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(core_dir.join("extra.dll"), b"kept").unwrap();
+
+        extract(&zip_path, &core_dir).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "exe");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            "kept",
+            "zip 里没有可选文件时应保留原有的"
+        );
+    }
+
+    /// 按文件名匹配, 因此 sing-box 那种带版本号的顶层目录不需要额外剥离。
+    #[test]
+    fn test_extract_artifacts_matches_by_file_name_in_nested_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("sing-box-1.2.3-windows-amd64/core.exe", &b"exe"[..]),
+                ("sing-box-1.2.3-windows-amd64/LICENSE", &b"license"[..]),
+            ],
+        );
+        let core_dir = dir.path().join("core");
+
+        extract(&zip_path, &core_dir).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "exe");
+        assert!(!core_dir.join("sing-box-1.2.3-windows-amd64").exists());
+        assert!(!core_dir.join("LICENSE").exists());
+    }
+
+    /// 路径穿越条目即使文件名在清单里, 也必须被拒绝。
+    #[test]
+    fn test_extract_artifacts_rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        write_test_zip(&zip_path, &[("../core.exe", &b"pwned"[..]), ("core.exe", &b"good"[..])]);
+        let core_dir = dir.path().join("core");
+
+        extract(&zip_path, &core_dir).unwrap();
+
+        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "good");
+        assert!(
+            !dir.path().join("core.exe").exists(),
+            "路径穿越条目被写到了 core_dir 之外"
+        );
     }
 }

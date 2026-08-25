@@ -77,6 +77,42 @@ impl Core {
     pub fn config_dir(self, exe_dir: &Path) -> PathBuf {
         exe_dir.join("configs").join(self.label())
     }
+
+    /// 更新核心时需要从 release zip 里取出的文件。
+    pub fn artifacts(self) -> CoreArtifacts {
+        match self {
+            Core::SingBox => CoreArtifacts {
+                required: &["sing-box.exe"],
+                optional: &["libcronet.dll"],
+            },
+            Core::Xray => CoreArtifacts {
+                required: &["xray.exe"],
+                optional: &["wintun.dll"],
+            },
+        }
+    }
+}
+
+/// 更新核心时从 release zip 中提取的文件清单。
+///
+/// 刻意只取这几个文件, 而不是解压整个包:
+/// - xray 包里带的 `geoip.dat` / `geosite.dat` 是官方版, 全量解压会盖掉用户
+///   自己配置的那套规则集 (settings.json 的 `download.ruleset`)
+/// - `LICENSE`、`README.md`、`xray_no_window.*` 对本程序没用, 白占几十 MB
+/// - 核心目录里还有 sing-box 运行时生成的 `cache.db`, 整体替换目录会连它
+///   一起丢掉
+pub struct CoreArtifacts {
+    /// 必需文件, 任意一个在 zip 里找不到都视为更新失败。
+    pub required: &'static [&'static str],
+    /// 可选文件, 找不到只记录警告 —— 官方随时可能调整打包内容。
+    pub optional: &'static [&'static str],
+}
+
+impl CoreArtifacts {
+    /// 是否需要提取该文件名。
+    pub fn wants(&self, file_name: &str) -> bool {
+        self.required.contains(&file_name) || self.optional.contains(&file_name)
+    }
 }
 
 #[derive(Clone)]
