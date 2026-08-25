@@ -8,7 +8,7 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tracing::warn;
 use windows::Win32::Foundation::CloseHandle;
@@ -56,7 +56,35 @@ pub struct AppState {
 pub static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
 
 /// 操作忙标志, 防止并发执行冲突操作。true 表示有操作正在执行。
-pub static BUSY: AtomicBool = AtomicBool::new(false);
+///
+/// 刻意不对外暴露, 只能通过 `BusyGuard` 占用和释放。
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// 忙标志的 RAII 守卫: 获取成功即占用标志, Drop 时释放。
+///
+/// 托盘命令分发有近十条提前返回路径 (取不到 exe 目录、应用状态不可用、
+/// 保存配置失败、创建后台线程失败……) 。手工配对 store(false) 时任何一条
+/// 路径漏掉释放, BUSY 就永久为 true, 之后所有菜单操作都只会提示"操作
+/// 进行中", 用户只能重启程序。交给 Drop 后, 提前返回、线程结束和 panic
+/// 展开都会自动释放。
+pub struct BusyGuard;
+
+impl BusyGuard {
+    /// 尝试占用忙标志。已有操作在执行时返回 `None`。
+    pub fn acquire() -> Option<Self> {
+        if BUSY.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        BUSY.store(false, Ordering::SeqCst);
+    }
+}
 
 /// 获取只读应用状态。Mutex 中毒时恢复并继续使用。
 pub fn app_state() -> Option<std::sync::MutexGuard<'static, AppState>> {
@@ -198,5 +226,31 @@ pub fn xray_state(app: &AppState) -> ProcessState {
         ProcessState::Running
     } else {
         ProcessState::NotRunning
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUSY 是全局状态, 相关断言集中在一个测试里, 避免并行执行时互相干扰。
+    #[test]
+    fn test_busy_guard_lifecycle() {
+        let guard = BusyGuard::acquire().expect("空闲时应能获取");
+        assert!(BusyGuard::acquire().is_none(), "已占用时不应重复获取");
+        drop(guard);
+        let guard = BusyGuard::acquire().expect("释放后应能重新获取");
+        drop(guard);
+
+        // panic 展开时同样释放, 否则一次后台操作 panic 就会永久锁死菜单
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            let _guard = BusyGuard::acquire().expect("panic 测试应能获取");
+            panic!("测试用 panic");
+        });
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "闭包应当 panic");
+        assert!(BusyGuard::acquire().is_some(), "panic 展开后应已释放");
     }
 }

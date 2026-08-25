@@ -22,7 +22,6 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 use tracing::{Event, debug, error, info, warn};
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
@@ -110,8 +109,10 @@ impl Drop for SingleInstanceGuard {
     }
 }
 
-/// 在后台线程中安全执行闭包, 捕获 panic 并通过 Toast 通知用户。
-fn spawn_safe<F: FnOnce() + Send + 'static>(name: &str, f: F) {
+/// 执行闭包并捕获 panic, 通过 Toast 通知用户。
+///
+/// 注意这个函数本身不创建线程, 只负责 panic 兜底; 创建线程的是 `spawn_bg`。
+fn run_catching_panic<F: FnOnce()>(name: &str, f: F) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     if let Err(e) = result {
         let msg = e
@@ -121,6 +122,32 @@ fn spawn_safe<F: FnOnce() + Send + 'static>(name: &str, f: F) {
             .unwrap_or_else(|| "未知内部错误".to_string());
         error!("后台线程 [{name}] panic: {msg}");
         toast::show_toast("内部错误", &msg);
+    }
+}
+
+/// 把操作放到后台线程执行, 避免阻塞托盘的消息循环。
+///
+/// `guard` 被 move 进线程, 无论闭包正常结束还是 panic 展开, 忙标志都会在
+/// 线程退出时释放。线程创建失败时闭包连同 `guard` 一起在此处 drop, 同样
+/// 不会泄漏忙标志。
+///
+/// 线程内独立初始化 COM: Toast 通知需要 COM, 而 COM 的初始化是线程局部的。
+fn spawn_bg<F: FnOnce() + Send + 'static>(name: &'static str, guard: state::BusyGuard, f: F) {
+    let spawned = std::thread::Builder::new().name(name.to_owned()).spawn(move || {
+        let _busy = guard;
+        let _com = match ComGuard::new() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!("COM 初始化失败: {e}");
+                None
+            }
+        };
+        run_catching_panic(name, f);
+    });
+
+    if let Err(e) = spawned {
+        error!("创建后台线程 [{name}] 失败: {e}");
+        toast::show_toast("操作失败", "无法创建后台线程, 请稍后重试");
     }
 }
 
@@ -305,227 +332,241 @@ fn run() -> Result<(), AppError> {
     Ok(())
 }
 
+/// 以 exe 目录为唯一参数的操作。
+type ExeDirFn = fn(&Path) -> Result<(), AppError>;
+
+/// 重启 / 终止类菜单命令。
+struct ServiceCommand {
+    label: &'static str,
+    run: ExeDirFn,
+}
+
+/// 核心更新类菜单命令。
+struct UpdateCommand {
+    label: &'static str,
+    run: fn(&Path, &str, u32, u64) -> Result<(), AppError>,
+}
+
+/// 把菜单 ID 映射为重启 / 终止命令, 未命中返回 `None`。
+///
+/// 标签和执行体绑定在同一张表里, 新增菜单项时不会出现"外层 match 加了 ID
+/// 但内层忘了写实现"的错配, 因此不再需要 `unreachable!` 兜底。
+fn service_command(id: u16) -> Option<ServiceCommand> {
+    let cmd = match id {
+        tray::ID_RESTART_SING => ServiceCommand {
+            label: "重启 sing-box",
+            run: process::restart_sing_box_at,
+        },
+        tray::ID_RESTART_XRAY => ServiceCommand {
+            label: "重启 xray",
+            run: process::restart_xray_at,
+        },
+        tray::ID_RESTART_ALL => ServiceCommand {
+            label: "重启所有服务",
+            run: process::restart_all_at,
+        },
+        tray::ID_STOP_SING => ServiceCommand {
+            label: "终止 sing-box",
+            run: |_| process::stop_processes(&["sing-box.exe"]),
+        },
+        tray::ID_STOP_XRAY => ServiceCommand {
+            label: "终止 xray",
+            run: |_| process::stop_processes(&["xray.exe"]),
+        },
+        tray::ID_STOP_ALL => ServiceCommand {
+            label: "终止所有服务",
+            run: |_| process::stop_all(),
+        },
+        _ => return None,
+    };
+    Some(cmd)
+}
+
+/// 把菜单 ID 映射为核心更新命令, 未命中返回 `None`。
+fn update_command(id: u16) -> Option<UpdateCommand> {
+    let cmd = match id {
+        tray::ID_UPDATE_ALL => UpdateCommand {
+            label: "更新所有核心",
+            run: update::update_cores,
+        },
+        tray::ID_UPDATE_SING => UpdateCommand {
+            label: "更新 sing-box",
+            run: update::update_sing_box,
+        },
+        tray::ID_UPDATE_XRAY => UpdateCommand {
+            label: "更新 xray",
+            run: update::update_xray,
+        },
+        _ => return None,
+    };
+    Some(cmd)
+}
+
+/// 把菜单 ID 映射为目标核心模式, 未命中返回 `None`。
+fn switch_core_mode(id: u16) -> Option<settings::CoreMode> {
+    match id {
+        tray::ID_SWITCH_CORE_XRAY => Some(settings::CoreMode::Xray),
+        tray::ID_SWITCH_CORE_SING => Some(settings::CoreMode::SingBox),
+        tray::ID_SWITCH_CORE_BOTH => Some(settings::CoreMode::Both),
+        _ => None,
+    }
+}
+
 /// 分发托盘菜单命令。
 ///
-/// 重启/终止/更新/切换配置操作在独立线程中执行 (避免阻塞 UI 线程) ,
-/// 每个线程独立初始化 COM。退出操作终止所有进程并销毁窗口。
+/// 耗时操作 (重启 / 终止 / 更新 / 切换配置) 都交给后台线程, 避免阻塞消息
+/// 循环。忙标志由 `BusyGuard` 管理: 交给后台线程的分支在线程结束时释放,
+/// 其余分支在本函数返回时释放, 提前返回不会漏。
 fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, ConfigAction>) {
-    if !matches!(id, tray::ID_OPEN_DIR | tray::ID_EXIT) && state::BUSY.swap(true, Ordering::SeqCst) {
+    // 打开目录和退出不占用忙标志: 前者只是拉起 explorer, 后者必须随时可用。
+    match id {
+        tray::ID_OPEN_DIR => return open_exe_dir(),
+        tray::ID_EXIT => return exit_app(hwnd),
+        _ => {}
+    }
+
+    let Some(guard) = state::BusyGuard::acquire() else {
         toast::show_toast("操作进行中", "请等待当前操作完成");
         return;
+    };
+
+    if let Some(cmd) = service_command(id) {
+        run_service_command(hwnd, guard, cmd);
+    } else if let Some(cmd) = update_command(id) {
+        run_update_command(hwnd, guard, cmd);
+    } else if let Some(mode) = switch_core_mode(id) {
+        run_switch_core(hwnd, guard, mode);
+    } else if let Some(action) = config_actions.get(&id).cloned() {
+        run_config_switch(guard, action);
+    } else {
+        debug!("忽略未知菜单项: {id}");
     }
-    match id {
-        tray::ID_RESTART_SING
-        | tray::ID_RESTART_XRAY
-        | tray::ID_RESTART_ALL
-        | tray::ID_STOP_SING
-        | tray::ID_STOP_XRAY
-        | tray::ID_STOP_ALL => {
-            let exe_dir = match state::exe_dir() {
-                Ok(d) => d,
-                Err(e) => {
-                    error!("获取 exe 目录失败: {e}");
-                    tray::show_error(hwnd, "操作失败", &e.to_string());
-                    return;
-                }
-            };
-            let _ = std::thread::Builder::new()
-                .name("bg-restart-stop".into())
-                .spawn(move || {
-                    let _com = match ComGuard::new() {
-                        Ok(c) => Some(c),
-                        Err(e) => {
-                            warn!("COM 初始化失败: {e}");
-                            None
-                        }
-                    };
-                    spawn_safe("restart-stop", move || {
-                        let label = match id {
-                            tray::ID_RESTART_SING => "重启 sing-box",
-                            tray::ID_RESTART_XRAY => "重启 xray",
-                            tray::ID_RESTART_ALL => "重启所有服务",
-                            tray::ID_STOP_SING => "终止 sing-box",
-                            tray::ID_STOP_XRAY => "终止 xray",
-                            tray::ID_STOP_ALL => "终止所有服务",
-                            _ => "",
-                        };
-                        info!("{label}");
-                        let result = match id {
-                            tray::ID_RESTART_SING => process::restart_sing_box_at(&exe_dir),
-                            tray::ID_RESTART_XRAY => process::restart_xray_at(&exe_dir),
-                            tray::ID_RESTART_ALL => process::restart_all_at(&exe_dir),
-                            tray::ID_STOP_SING => process::stop_processes(&["sing-box.exe"]),
-                            tray::ID_STOP_XRAY => process::stop_processes(&["xray.exe"]),
-                            tray::ID_STOP_ALL => process::stop_all(),
-                            _ => unreachable!(),
-                        };
-                        if let Err(err) = result {
-                            error!("操作失败: {err}");
-                            toast::show_toast("操作失败", &err.to_string());
-                        }
-                    });
-                    state::BUSY.store(false, Ordering::SeqCst);
-                });
+}
+
+fn open_exe_dir() {
+    let exe_dir = match state::exe_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            error!("获取 exe 目录失败: {e}");
+            return;
         }
-        tray::ID_UPDATE_ALL | tray::ID_UPDATE_SING | tray::ID_UPDATE_XRAY => {
-            let exe_dir = match state::exe_dir() {
-                Ok(d) => d,
-                Err(e) => {
-                    error!("获取 exe 目录失败: {e}");
-                    tray::show_error(hwnd, "操作失败", &e.to_string());
-                    return;
-                }
-            };
-            let (gh_proxy, max_retries, delay_secs) = {
-                let app = match state::app_state() {
-                    Some(a) => a,
-                    None => {
-                        error!("应用状态不可用");
-                        tray::show_error(hwnd, "操作失败", "应用状态不可用");
-                        return;
-                    }
-                };
-                let s = &app.settings;
-                (
-                    s.download.core.gh_proxy.clone(),
-                    s.download.retry.max_retries,
-                    s.download.retry.delay_secs,
-                )
-            };
-            if let Err(e) = process::stop_all() {
-                warn!("更新前终止进程失败: {e}");
-            }
-            let _ = std::thread::Builder::new().name("bg-update".into()).spawn(move || {
-                let _com = match ComGuard::new() {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        warn!("COM 初始化失败: {e}");
-                        None
-                    }
-                };
-                spawn_safe("update", move || {
-                    let label = match id {
-                        tray::ID_UPDATE_ALL => "更新所有核心",
-                        tray::ID_UPDATE_SING => "更新 sing-box",
-                        tray::ID_UPDATE_XRAY => "更新 xray",
-                        _ => "",
-                    };
-                    info!("{label}");
-                    let result = match id {
-                        tray::ID_UPDATE_ALL => update::update_cores(&exe_dir, &gh_proxy, max_retries, delay_secs),
-                        tray::ID_UPDATE_SING => update::update_sing_box(&exe_dir, &gh_proxy, max_retries, delay_secs),
-                        tray::ID_UPDATE_XRAY => update::update_xray(&exe_dir, &gh_proxy, max_retries, delay_secs),
-                        _ => unreachable!(),
-                    };
-                    if let Err(e) = result {
-                        error!("更新失败: {e}");
-                        toast::show_toast("更新失败", &e.to_string());
-                    }
-                });
-                state::BUSY.store(false, Ordering::SeqCst);
-            });
+    };
+    info!("打开程序目录: {}", exe_dir.display());
+    let _ = Command::new("explorer").arg(&exe_dir).spawn();
+}
+
+fn exit_app(hwnd: isize) {
+    info!("退出程序");
+    if let Err(e) = process::stop_all() {
+        warn!("退出时终止进程失败: {e}");
+    }
+    unsafe {
+        let _ = DestroyWindow(HWND(hwnd as *mut std::ffi::c_void));
+    }
+}
+
+fn run_service_command(hwnd: isize, guard: state::BusyGuard, cmd: ServiceCommand) {
+    let exe_dir = match state::exe_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            error!("获取 exe 目录失败: {e}");
+            tray::show_error(hwnd, "操作失败", &e.to_string());
+            return;
         }
-        tray::ID_SWITCH_CORE_XRAY | tray::ID_SWITCH_CORE_SING | tray::ID_SWITCH_CORE_BOTH => {
-            let new_mode = match id {
-                tray::ID_SWITCH_CORE_XRAY => settings::CoreMode::Xray,
-                tray::ID_SWITCH_CORE_SING => settings::CoreMode::SingBox,
-                tray::ID_SWITCH_CORE_BOTH => settings::CoreMode::Both,
-                _ => unreachable!(),
-            };
-            if let Err(e) = process::stop_all() {
-                warn!("切换核心前终止进程失败: {e}");
-            }
-            {
-                let mut app = match state::app_state_mut() {
-                    Some(a) => a,
-                    None => {
-                        error!("应用状态不可用");
-                        return;
-                    }
-                };
-                app.settings.core.mode = new_mode;
-                if let Err(e) = app.settings.save(&app.exe_dir) {
-                    error!("保存核心模式失败: {e}");
-                    tray::show_error(hwnd, "操作失败", &e.to_string());
-                    return;
-                }
-            }
-            info!("核心模式已切换为: {new_mode:?}");
-            state::BUSY.store(false, Ordering::SeqCst);
+    };
+    spawn_bg("bg-restart-stop", guard, move || {
+        info!("{}", cmd.label);
+        if let Err(err) = (cmd.run)(&exe_dir) {
+            error!("操作失败: {err}");
+            toast::show_toast("操作失败", &err.to_string());
         }
-        tray::ID_OPEN_DIR => {
-            let exe_dir = match state::exe_dir() {
-                Ok(d) => d,
-                Err(e) => {
-                    error!("获取 exe 目录失败: {e}");
-                    return;
-                }
-            };
-            info!("打开程序目录: {}", exe_dir.display());
-            let _ = Command::new("explorer").arg(&exe_dir).spawn();
+    });
+}
+
+fn run_update_command(hwnd: isize, guard: state::BusyGuard, cmd: UpdateCommand) {
+    let exe_dir = match state::exe_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            error!("获取 exe 目录失败: {e}");
+            tray::show_error(hwnd, "操作失败", &e.to_string());
+            return;
         }
-        tray::ID_EXIT => {
-            info!("退出程序");
-            if let Err(e) = process::stop_all() {
-                warn!("退出时终止进程失败: {e}");
+    };
+    let (gh_proxy, max_retries, delay_secs) = {
+        let app = match state::app_state() {
+            Some(a) => a,
+            None => {
+                error!("应用状态不可用");
+                tray::show_error(hwnd, "操作失败", "应用状态不可用");
+                return;
             }
-            unsafe {
-                let _ = DestroyWindow(HWND(hwnd as *mut std::ffi::c_void));
-            }
+        };
+        let s = &app.settings;
+        (
+            s.download.core.gh_proxy.clone(),
+            s.download.retry.max_retries,
+            s.download.retry.delay_secs,
+        )
+    };
+    if let Err(e) = process::stop_all() {
+        warn!("更新前终止进程失败: {e}");
+    }
+    spawn_bg("bg-update", guard, move || {
+        info!("{}", cmd.label);
+        if let Err(e) = (cmd.run)(&exe_dir, &gh_proxy, max_retries, delay_secs) {
+            error!("更新失败: {e}");
+            toast::show_toast("更新失败", &e.to_string());
         }
-        _ => {
-            let action = match config_actions.get(&id).cloned() {
-                Some(a) => a,
-                None => return,
-            };
-            let _ = std::thread::Builder::new()
-                .name("bg-config-switch".into())
-                .spawn(move || {
-                    let _com = match ComGuard::new() {
-                        Ok(c) => Some(c),
-                        Err(e) => {
-                            warn!("COM 初始化失败: {e}");
-                            None
-                        }
-                    };
-                    spawn_safe("config-switch", move || {
-                        let exe_dir = match state::exe_dir() {
-                            Ok(d) => d,
-                            Err(e) => {
-                                error!("获取 exe 目录失败: {e}");
-                                return;
-                            }
-                        };
-                        info!("切换配置: {}", action.path.display());
-                        let result = match action.kind {
-                            state::ConfigKind::SingBox => {
-                                let dest = exe_dir.join("configs").join("sing-box.json");
-                                debug!("复制配置: {} -> {}", action.path.display(), dest.display());
-                                if let Err(e) = fs::copy(&action.path, &dest) {
-                                    error!("复制配置失败: {e}");
-                                    toast::show_toast("操作失败", &e.to_string());
-                                    return;
-                                }
-                                process::restart_sing_box_at(&exe_dir)
-                            }
-                            state::ConfigKind::Xray => {
-                                let dest = exe_dir.join("configs").join("xray.json");
-                                debug!("复制配置: {} -> {}", action.path.display(), dest.display());
-                                if let Err(e) = fs::copy(&action.path, &dest) {
-                                    error!("复制配置失败: {e}");
-                                    toast::show_toast("操作失败", &e.to_string());
-                                    return;
-                                }
-                                process::restart_xray_at(&exe_dir)
-                            }
-                        };
-                        if let Err(err) = result {
-                            error!("操作失败: {err}");
-                            toast::show_toast("操作失败", &err.to_string());
-                        }
-                    });
-                    state::BUSY.store(false, Ordering::SeqCst);
-                });
+    });
+}
+
+fn run_switch_core(hwnd: isize, _guard: state::BusyGuard, new_mode: settings::CoreMode) {
+    if let Err(e) = process::stop_all() {
+        warn!("切换核心前终止进程失败: {e}");
+    }
+    {
+        let mut app = match state::app_state_mut() {
+            Some(a) => a,
+            None => {
+                error!("应用状态不可用");
+                return;
+            }
+        };
+        app.settings.core.mode = new_mode;
+        if let Err(e) = app.settings.save(&app.exe_dir) {
+            error!("保存核心模式失败: {e}");
+            tray::show_error(hwnd, "操作失败", &e.to_string());
+            return;
         }
     }
+    info!("核心模式已切换为: {new_mode:?}");
+}
+
+fn run_config_switch(guard: state::BusyGuard, action: ConfigAction) {
+    spawn_bg("bg-config-switch", guard, move || {
+        let exe_dir = match state::exe_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                error!("获取 exe 目录失败: {e}");
+                return;
+            }
+        };
+        let (dest_name, restart): (&str, ExeDirFn) = match action.kind {
+            state::ConfigKind::SingBox => ("sing-box.json", process::restart_sing_box_at),
+            state::ConfigKind::Xray => ("xray.json", process::restart_xray_at),
+        };
+        let dest = exe_dir.join("configs").join(dest_name);
+
+        info!("切换配置: {}", action.path.display());
+        debug!("复制配置: {} -> {}", action.path.display(), dest.display());
+        if let Err(e) = fs::copy(&action.path, &dest) {
+            error!("复制配置失败: {e}");
+            toast::show_toast("操作失败", &e.to_string());
+            return;
+        }
+        if let Err(err) = restart(&exe_dir) {
+            error!("操作失败: {err}");
+            toast::show_toast("操作失败", &err.to_string());
+        }
+    });
 }
