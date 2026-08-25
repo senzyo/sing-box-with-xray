@@ -143,7 +143,7 @@ fn install_panic_hook() {
 /// 闭包内的 panic 不在这里兜底 —— release 构建是 abort, 展开根本不会发生,
 /// 清理由 `install_panic_hook` 负责。`name` 会成为线程名, panic 日志据此
 /// 指出是哪个后台操作出的问题。
-fn spawn_bg<F: FnOnce() + Send + 'static>(name: &'static str, guard: state::BusyGuard, f: F) {
+fn spawn_bg<F: FnOnce() + Send + 'static>(name: &'static str, guard: state::FlagGuard, f: F) {
     let spawned = std::thread::Builder::new().name(name.to_owned()).spawn(move || {
         let _busy = guard;
         let _com = match ComGuard::new() {
@@ -428,7 +428,7 @@ fn switch_core_mode(id: u16) -> Option<settings::CoreMode> {
 /// 分发托盘菜单命令。
 ///
 /// 耗时操作 (重启 / 终止 / 更新 / 切换配置) 都交给后台线程, 避免阻塞消息
-/// 循环。忙标志由 `BusyGuard` 管理: 交给后台线程的分支在线程结束时释放,
+/// 循环。忙标志由 `FlagGuard` 管理: 交给后台线程的分支在线程结束时释放,
 /// 其余分支在本函数返回时释放, 提前返回不会漏。
 fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, ConfigAction>) {
     // 打开目录和退出不占用忙标志: 前者只是拉起 explorer, 后者必须随时可用。
@@ -438,7 +438,7 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
         _ => {}
     }
 
-    let Some(guard) = state::BusyGuard::acquire() else {
+    let Some(guard) = state::acquire_busy() else {
         toast::show_toast("操作进行中", "请等待当前操作完成");
         return;
     };
@@ -480,7 +480,7 @@ fn exit_app(hwnd: isize) {
     }
 }
 
-fn run_service_command(hwnd: isize, guard: state::BusyGuard, cmd: ServiceCommand) {
+fn run_service_command(hwnd: isize, guard: state::FlagGuard, cmd: ServiceCommand) {
     let exe_dir = match state::exe_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -498,7 +498,7 @@ fn run_service_command(hwnd: isize, guard: state::BusyGuard, cmd: ServiceCommand
     });
 }
 
-fn run_update_command(hwnd: isize, guard: state::BusyGuard, cmd: UpdateCommand) {
+fn run_update_command(hwnd: isize, guard: state::FlagGuard, cmd: UpdateCommand) {
     let exe_dir = match state::exe_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -537,7 +537,7 @@ fn run_update_command(hwnd: isize, guard: state::BusyGuard, cmd: UpdateCommand) 
     });
 }
 
-fn run_switch_core(guard: state::BusyGuard, new_mode: settings::CoreMode) {
+fn run_switch_core(guard: state::FlagGuard, new_mode: settings::CoreMode) {
     spawn_bg("bg-switch-core", guard, move || {
         // 与更新核心同理: stop_all 涉及进程枚举和注册表读写, 不能在 UI 线程做。
         if let Err(e) = process::stop_all() {
@@ -563,7 +563,7 @@ fn run_switch_core(guard: state::BusyGuard, new_mode: settings::CoreMode) {
     });
 }
 
-fn run_config_switch(guard: state::BusyGuard, action: ConfigAction) {
+fn run_config_switch(guard: state::FlagGuard, action: ConfigAction) {
     spawn_bg("bg-config-switch", guard, move || {
         let exe_dir = match state::exe_dir() {
             Ok(d) => d,

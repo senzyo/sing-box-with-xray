@@ -10,6 +10,7 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::ptr::null;
+use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
@@ -215,6 +216,34 @@ fn kill_processes_by_name(exe_name: &str) {
 // 重启
 // ═══════════════════════════════════════════════
 
+/// 规则集更新是否正在进行。
+static RULESET_UPDATING: AtomicBool = AtomicBool::new(false);
+
+/// 在独立线程中启动规则集更新, 立即返回。
+///
+/// 刻意不占用菜单的忙标志: 更新会先等 5 秒网络就绪, 再串行下载几十 MB 的 dat
+/// 文件, 整个过程可能持续几十秒甚至更久。挂在忙标志上会让用户切一次配置后长
+/// 时间无法做任何操作, 而规则集是否更新完并不影响核心已经启动这一事实。
+///
+/// 用独立的标志防重入: 连续切换配置会重复触发, 两个线程会写同一批 .dat.tmp
+/// 临时文件并互相覆盖。
+fn spawn_ruleset_update() {
+    let Some(guard) = state::FlagGuard::acquire(&RULESET_UPDATING) else {
+        debug!("[ruleset] 已有更新在进行, 跳过本次触发");
+        return;
+    };
+
+    let spawned = std::thread::Builder::new().name("bg-ruleset".into()).spawn(move || {
+        let _guard = guard;
+        run_ruleset_update();
+    });
+
+    // 线程创建失败时闭包连同 guard 一起在此 drop, 标志不会泄漏
+    if let Err(e) = spawned {
+        warn!("[ruleset] 创建更新线程失败: {e}");
+    }
+}
+
 /// 执行规则集更新 (静默, 失败仅 warn) 。
 ///
 /// 分两阶段获取锁: 下载前克隆数据释放锁, 下载完成后再获取锁更新 `last_update`,
@@ -261,7 +290,7 @@ pub fn restart_all_at(exe_dir: &Path) -> Result<(), AppError> {
     cleanup_orphaned_wintun();
     start_sing_box_at(exe_dir)?;
     start_xray_at(exe_dir)?;
-    run_ruleset_update();
+    spawn_ruleset_update();
     Ok(())
 }
 
@@ -275,7 +304,7 @@ pub fn restart_xray_at(exe_dir: &Path) -> Result<(), AppError> {
     stop_processes(&["xray.exe"])?;
     cleanup_orphaned_wintun();
     start_xray_at(exe_dir)?;
-    run_ruleset_update();
+    spawn_ruleset_update();
     Ok(())
 }
 
