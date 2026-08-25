@@ -27,21 +27,38 @@ const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 // ureq 3 的所有超时默认都是 None (含 DNS 解析、建连和读取) , 不显式设置的话
 // 服务器接受连接后不发数据就会永久挂起, 下载线程永远不返回。
+//
+// 但各阶段的超时不是各管一段, 配文件下载时必须分清两种语义:
+// - 阶段自身的 deadline 每次读写前重新从当前时刻起算, 也就是空闲超时: 连续
+//   这么久收不到任何数据才算超时
+// - 每个阶段还会带上前一阶段的 deadline 一起比较, 取最先到的那个。前一阶段的
+//   deadline 从它结束的那一刻算起, 不会随读写刷新
+//
+// 响应体的前一阶段正是响应头, 所以 timeout_recv_response 一旦设值, 它就成了
+// "从收完响应头起整个响应体必须下完"的绝对上限, 而不是文档里写的"只管响应
+// 头"。30 秒配 20 MB 的核心 zip 等于要求 700 KB/s, 达不到就必然超时, 重试再
+// 多次也一样 —— 换 CDN 代理时首次回源就是这个情形。
+//
+// 因此文件下载刻意不设 timeout_recv_response, 等响应头改由 timeout_send_request
+// 兜: 它是响应头阶段的前一阶段, 而响应体阶段不看它, 不会传导下去。
 
 /// GitHub API、校验和等小响应请求的端到端超时。
 const SMALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 文件下载的建连超时, 含 DNS 解析与 TLS 握手。
+/// 文件下载的建连超时, 含 TLS 握手。
+///
+/// DNS 解析是建连之前的独立阶段, 不受这一项约束 —— 没有设 timeout_resolve,
+/// 那一段靠系统解析器自己的超时。
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 文件下载接收响应头的超时。
-const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 文件下载从发出请求到收完响应头的上限。
+const DOWNLOAD_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 文件下载接收响应体的总时长上限。
+/// 文件下载的空闲超时: 连续这么久没收到任何数据就放弃。
 ///
-/// ureq 只提供总时长上限, 没有空闲超时。核心 zip 与规则集 dat 通常在
-/// 10~30 MB, 10 分钟对应约 20~50 KB/s 的速度下限, 比这更慢时重试也无意义。
-const DOWNLOAD_BODY_TIMEOUT: Duration = Duration::from_secs(600);
+/// 刻意不设总时长上限: 下载耗时是文件大小乘链路速度, 固定上限只会在慢链路上
+/// 误杀一次本来能完成的下载。只要数据还在流动就让它下完, 真卡死才中止。
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 发起带超时的 GET 请求并把响应体读成字符串, 用于 GitHub API 和校验和文件。
 fn get_text(url: &str) -> Result<String, AppError> {
@@ -389,8 +406,10 @@ fn download_file(url: &str, dest: &Path) -> Result<(), AppError> {
     let resp = ureq::get(url)
         .config()
         .timeout_connect(Some(DOWNLOAD_CONNECT_TIMEOUT))
-        .timeout_recv_response(Some(DOWNLOAD_RESPONSE_TIMEOUT))
-        .timeout_recv_body(Some(DOWNLOAD_BODY_TIMEOUT))
+        .timeout_send_request(Some(DOWNLOAD_HEADER_TIMEOUT))
+        // 不要给 timeout_recv_response 设值: 见文件开头的说明, 它会变成整个
+        // 响应体的绝对上限, 慢链路上必定超时
+        .timeout_recv_body(Some(DOWNLOAD_STALL_TIMEOUT))
         .build()
         .header("User-Agent", USER_AGENT)
         .call()
@@ -399,7 +418,9 @@ fn download_file(url: &str, dest: &Path) -> Result<(), AppError> {
     let mut reader = resp.into_body().into_reader();
     let mut file = fs::File::create(dest).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
 
-    let bytes = io::copy(&mut reader, &mut file).map_err(|e| AppError::Msg(format!("写入文件失败: {e}")))?;
+    // io::copy 分不清是读取还是写入出错, 用中性描述: 这里最常见的是接收超时,
+    // 写成"写入文件失败"会把人往磁盘问题上引
+    let bytes = io::copy(&mut reader, &mut file).map_err(|e| AppError::Msg(format!("下载数据失败: {e}")))?;
     info!("下载完成: {} ({:.1} MB)", dest.display(), bytes as f64 / 1_048_576.0);
 
     Ok(())
