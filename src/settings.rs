@@ -159,6 +159,11 @@ impl Default for Download {
 
 const ALLOWED_LEVELS: &[&str] = &["debug", "info", "warn", "error"];
 
+/// 规则集更新间隔上限 (天) 。
+///
+/// 除了避免无意义的巨大间隔, 也防止 `interval_days * 86400` 溢出 u64。
+const MAX_INTERVAL_DAYS: u64 = 365;
+
 impl Settings {
     /// 从 `exe_dir/settings.json` 加载配置。
     /// 文件不存在或格式错误时打印警告并返回默认值。
@@ -235,6 +240,12 @@ impl Settings {
             self.download.retry.delay_secs = 30;
         }
 
+        // interval_days 允许为 0, 语义是每次启动都更新规则集。
+        if self.download.ruleset.interval_days > MAX_INTERVAL_DAYS {
+            warnings.push(format!("interval_days 超出上限 {MAX_INTERVAL_DAYS}, 已自动限制"));
+            self.download.ruleset.interval_days = MAX_INTERVAL_DAYS;
+        }
+
         warnings
     }
 }
@@ -309,6 +320,44 @@ mod tests {
         let (s, warnings) = parse_settings(r#"{"download":{"retry":{"delay_secs":31}}}"#).unwrap();
         assert_eq!(s.download.retry.delay_secs, 30);
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_settings_interval_days_bounds() {
+        let (s, warnings) = parse_settings(r#"{"download":{"ruleset":{"interval_days":100000}}}"#).unwrap();
+        assert_eq!(s.download.ruleset.interval_days, MAX_INTERVAL_DAYS);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("interval_days"));
+
+        // 0 是合法值, 语义为每次启动都更新规则集
+        let (s, warnings) = parse_settings(r#"{"download":{"ruleset":{"interval_days":0}}}"#).unwrap();
+        assert_eq!(s.download.ruleset.interval_days, 0);
+        assert!(warnings.is_empty());
+    }
+
+    /// Ruleset 用 serde flatten 收集规则集条目, 同时保留具名的 interval_days,
+    /// 两者共存时不应互相吞掉。
+    #[test]
+    fn test_parse_settings_ruleset_entries_and_interval() {
+        let json = r#"{
+            "download": {
+                "ruleset": {
+                    "geoip": {
+                        "dat": "https://example.com/geoip.dat",
+                        "sha256sum": "https://example.com/geoip.dat.sha256sum",
+                        "last_update": 1700000000
+                    },
+                    "interval_days": 7
+                }
+            }
+        }"#;
+        let (s, warnings) = parse_settings(json).unwrap();
+        assert_eq!(s.download.ruleset.interval_days, 7);
+        assert_eq!(s.download.ruleset.entries.len(), 1);
+        let entry = &s.download.ruleset.entries["geoip"];
+        assert_eq!(entry.dat, "https://example.com/geoip.dat");
+        assert_eq!(entry.last_update, Some(1700000000));
+        assert!(warnings.is_empty());
     }
 
     #[test]

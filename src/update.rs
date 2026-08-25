@@ -475,7 +475,9 @@ pub fn update_ruleset(
     max_retries: u32,
     delay_secs: u64,
 ) -> Vec<String> {
-    let interval_secs = ruleset.interval_days * 86400;
+    // interval_days 由 Settings::validate 限制在上限内; saturating_mul 是
+    // 针对绕过校验直接调用本函数的兜底, 避免溢出 (debug 构建下会 panic) 。
+    let interval_secs = ruleset.interval_days.saturating_mul(86400);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
