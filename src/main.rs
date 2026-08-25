@@ -435,7 +435,7 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
     } else if let Some(cmd) = update_command(id) {
         run_update_command(hwnd, guard, cmd);
     } else if let Some(mode) = switch_core_mode(id) {
-        run_switch_core(hwnd, guard, mode);
+        run_switch_core(guard, mode);
     } else if let Some(action) = config_actions.get(&id).cloned() {
         run_config_switch(guard, action);
     } else {
@@ -457,6 +457,8 @@ fn open_exe_dir() {
 
 fn exit_app(hwnd: isize) {
     info!("退出程序");
+    // 这里刻意同步执行: 一旦 DestroyWindow 触发消息循环退出, 进程很快就会
+    // 结束, 放到后台线程会来不及恢复物理网卡 DNS。
     if let Err(e) = process::stop_all() {
         warn!("退出时终止进程失败: {e}");
     }
@@ -508,11 +510,13 @@ fn run_update_command(hwnd: isize, guard: state::BusyGuard, cmd: UpdateCommand) 
             s.download.retry.delay_secs,
         )
     };
-    if let Err(e) = process::stop_all() {
-        warn!("更新前终止进程失败: {e}");
-    }
     spawn_bg("bg-update", guard, move || {
         info!("{}", cmd.label);
+        // 放在后台线程里终止进程: stop_all 会枚举进程、逐块物理网卡读写注册表
+        // 恢复 DNS 并刷新 DNS 缓存, 在 UI 线程执行会卡住托盘菜单。
+        if let Err(e) = process::stop_all() {
+            warn!("更新前终止进程失败: {e}");
+        }
         if let Err(e) = (cmd.run)(&exe_dir, &gh_proxy, max_retries, delay_secs) {
             error!("更新失败: {e}");
             toast::show_toast("更新失败", &e.to_string());
@@ -520,26 +524,30 @@ fn run_update_command(hwnd: isize, guard: state::BusyGuard, cmd: UpdateCommand) 
     });
 }
 
-fn run_switch_core(hwnd: isize, _guard: state::BusyGuard, new_mode: settings::CoreMode) {
-    if let Err(e) = process::stop_all() {
-        warn!("切换核心前终止进程失败: {e}");
-    }
-    {
-        let mut app = match state::app_state_mut() {
-            Some(a) => a,
-            None => {
-                error!("应用状态不可用");
+fn run_switch_core(guard: state::BusyGuard, new_mode: settings::CoreMode) {
+    spawn_bg("bg-switch-core", guard, move || {
+        // 与更新核心同理: stop_all 涉及进程枚举和注册表读写, 不能在 UI 线程做。
+        if let Err(e) = process::stop_all() {
+            warn!("切换核心前终止进程失败: {e}");
+        }
+        {
+            let mut app = match state::app_state_mut() {
+                Some(a) => a,
+                None => {
+                    error!("应用状态不可用");
+                    toast::show_toast("操作失败", "应用状态不可用");
+                    return;
+                }
+            };
+            app.settings.core.mode = new_mode;
+            if let Err(e) = app.settings.save(&app.exe_dir) {
+                error!("保存核心模式失败: {e}");
+                toast::show_toast("操作失败", &e.to_string());
                 return;
             }
-        };
-        app.settings.core.mode = new_mode;
-        if let Err(e) = app.settings.save(&app.exe_dir) {
-            error!("保存核心模式失败: {e}");
-            tray::show_error(hwnd, "操作失败", &e.to_string());
-            return;
         }
-    }
-    info!("核心模式已切换为: {new_mode:?}");
+        info!("核心模式已切换为: {new_mode:?}");
+    });
 }
 
 fn run_config_switch(guard: state::BusyGuard, action: ConfigAction) {
