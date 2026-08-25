@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -170,8 +169,12 @@ pub fn update_xray(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_s
 }
 
 /// 运行可执行文件的版本命令并从 stdout 提取版本号, 失败返回 "0.0.0"。
+///
+/// 必须用 `hidden_command`: sing-box 和 xray 都是控制台程序, release 构建的
+/// 本程序是 GUI 子系统, 用裸 Command 启动会分配新控制台, 每次检查版本闪一次
+/// 黑窗。debug 构建有控制台可继承, 因此这个问题只在 release 下可见。
 pub(crate) fn get_local_version(exe_path: &Path, version_arg: &str) -> String {
-    let output = match Command::new(exe_path).arg(version_arg).output() {
+    let output = match crate::process::hidden_command(exe_path).arg(version_arg).output() {
         Ok(out) => out,
         Err(e) => {
             warn!("获取版本失败 ({}): {e}", exe_path.display());
