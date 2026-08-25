@@ -87,7 +87,7 @@ impl Core {
             },
             Core::Xray => CoreArtifacts {
                 required: &["xray.exe"],
-                optional: &["wintun.dll"],
+                optional: &["wintun.dll", "geoip.dat", "geosite.dat"],
             },
         }
     }

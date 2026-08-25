@@ -44,7 +44,7 @@
       {
         "address": "https+local://dns.alidns.com/dns-query",
         "domains": ["geosite:cn"],
-        "expectedIPs": ["geoip-only-cn-private:cn"],
+        "expectedIPs": ["geoip:cn"],
         "skipFallback": true,
         "tag": "dns-ali-2"
       }
@@ -174,7 +174,7 @@
         "outboundTag": "out-direct"
       },
       {
-        "ip": ["geoip-only-cn-private:private"],
+        "ip": ["geoip:private"],
         "outboundTag": "out-direct"
       },
       {
@@ -211,7 +211,7 @@
         "outboundTag": "out-direct"
       },
       {
-        "ip": ["geoip-only-cn-private:cn"],
+        "ip": ["geoip:cn"],
         "outboundTag": "out-direct"
       }
     ]
