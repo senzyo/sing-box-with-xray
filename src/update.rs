@@ -10,12 +10,46 @@ use std::fs;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::error::AppError;
 
 /// GitHub API 要求的 User-Agent 头, 缺少会返回 403。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
+
+// ureq 3 的所有超时默认都是 None (含 DNS 解析、建连和读取) , 不显式设置的话
+// 服务器接受连接后不发数据就会永久挂起, 下载线程永远不返回。
+
+/// GitHub API、校验和等小响应请求的端到端超时。
+const SMALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 文件下载的建连超时, 含 DNS 解析与 TLS 握手。
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 文件下载接收响应头的超时。
+const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 文件下载接收响应体的总时长上限。
+///
+/// ureq 只提供总时长上限, 没有空闲超时。核心 zip 与规则集 dat 通常在
+/// 10~30 MB, 10 分钟对应约 20~50 KB/s 的速度下限, 比这更慢时重试也无意义。
+const DOWNLOAD_BODY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 发起带超时的 GET 请求并把响应体读成字符串, 用于 GitHub API 和校验和文件。
+fn get_text(url: &str) -> Result<String, AppError> {
+    let resp = ureq::get(url)
+        .config()
+        .timeout_global(Some(SMALL_REQUEST_TIMEOUT))
+        .build()
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| AppError::Msg(format!("请求失败: {e}")))?;
+
+    resp.into_body()
+        .read_to_string()
+        .map_err(|e| AppError::Msg(format!("读取响应失败: {e}")))
+}
 
 // 编译时根据目标架构确定下载文件名。
 // amd64 编译产物只下载 amd64 核心, arm64 编译产物只下载 arm64 核心。
@@ -207,15 +241,7 @@ fn is_newer(local: &str, remote: &str) -> bool {
 fn fetch_sing_box_release() -> Result<(String, Vec<Value>), AppError> {
     let api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
     debug!("请求 GitHub API: {api_url}");
-    let resp = ureq::get(api_url)
-        .header("User-Agent", USER_AGENT)
-        .call()
-        .map_err(|e| AppError::Msg(format!("请求 GitHub API 失败: {e}")))?;
-
-    let body = resp
-        .into_body()
-        .read_to_string()
-        .map_err(|e| AppError::Msg(format!("读取 GitHub API 响应失败: {e}")))?;
+    let body = get_text(api_url).map_err(|e| AppError::Msg(format!("请求 GitHub API 失败: {e}")))?;
 
     let json: Value =
         serde_json::from_str(&body).map_err(|e| AppError::Msg(format!("解析 GitHub API 响应失败: {e}")))?;
@@ -238,15 +264,7 @@ fn fetch_sing_box_release() -> Result<(String, Vec<Value>), AppError> {
 fn fetch_xray_release(zip_name: &str) -> Result<(String, Vec<Value>), AppError> {
     let api_url = "https://api.github.com/repos/XTLS/Xray-core/releases";
     debug!("请求 GitHub API: {api_url}");
-    let resp = ureq::get(api_url)
-        .header("User-Agent", USER_AGENT)
-        .call()
-        .map_err(|e| AppError::Msg(format!("请求 GitHub API 失败: {e}")))?;
-
-    let body = resp
-        .into_body()
-        .read_to_string()
-        .map_err(|e| AppError::Msg(format!("读取 GitHub API 响应失败: {e}")))?;
+    let body = get_text(api_url).map_err(|e| AppError::Msg(format!("请求 GitHub API 失败: {e}")))?;
 
     let releases: Vec<Value> =
         serde_json::from_str(&body).map_err(|e| AppError::Msg(format!("解析 GitHub API 响应失败: {e}")))?;
@@ -356,6 +374,11 @@ fn download_file(url: &str, dest: &Path) -> Result<(), AppError> {
     }
 
     let resp = ureq::get(url)
+        .config()
+        .timeout_connect(Some(DOWNLOAD_CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(DOWNLOAD_RESPONSE_TIMEOUT))
+        .timeout_recv_body(Some(DOWNLOAD_BODY_TIMEOUT))
+        .build()
         .header("User-Agent", USER_AGENT)
         .call()
         .map_err(|e| AppError::Msg(format!("下载失败: {e}")))?;
@@ -537,18 +560,10 @@ fn download_and_parse_sha256sum(url: &str, max_retries: u32, delay_secs: u64) ->
         }
 
         debug!("下载 SHA256 校验和: {url}");
-        let resp = match ureq::get(url).header("User-Agent", USER_AGENT).call() {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("SHA256 校验和下载失败 (第 {attempt}/{max_retries} 次): {e}");
-                continue;
-            }
-        };
-
-        let body = match resp.into_body().read_to_string() {
+        let body = match get_text(url) {
             Ok(b) => b,
             Err(e) => {
-                warn!("SHA256 校验和读取失败 (第 {attempt}/{max_retries} 次): {e}");
+                warn!("SHA256 校验和获取失败 (第 {attempt}/{max_retries} 次): {e}");
                 continue;
             }
         };
