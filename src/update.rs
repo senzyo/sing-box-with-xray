@@ -114,6 +114,9 @@ pub fn update_sing_box(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, del
     ) {
         error!("[sing-box] 下载失败: {e}");
         crate::toast::show_toast_tagged("sing-box", "下载失败, 请稍后重试", tag);
+        // 刻意返回 Ok: 一是 update_cores 用 ? 串联两个核心, 返回 Err 会跳过
+        // xray 的更新; 二是上面的 tagged toast 已经就地通知过用户, 再返回
+        // Err 会让调用方多弹一个"更新失败"。
         return Ok(());
     }
 
@@ -163,6 +166,7 @@ pub fn update_xray(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_s
     ) {
         error!("[xray] 下载失败: {e}");
         crate::toast::show_toast_tagged("xray", "下载失败, 请稍后重试", tag);
+        // 与 update_sing_box 同理, 刻意返回 Ok, 见那里的说明
         return Ok(());
     }
 

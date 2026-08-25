@@ -28,7 +28,7 @@ use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
 use tracing_subscriber::prelude::*;
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Console::{
     CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, SetConsoleMode,
@@ -90,7 +90,8 @@ impl SingleInstanceGuard {
         unsafe {
             let handle = CreateMutexW(None, false, PCWSTR(name.as_ptr()))
                 .map_err(|e| AppError::Msg(format!("创建单实例互斥体失败: {e}")))?;
-            let already_exists = std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ALREADY_EXISTS.0 as i32);
+            // 必须紧跟 CreateMutexW 读取, 中间任何一次 Win32 调用都会覆盖它
+            let already_exists = GetLastError() == ERROR_ALREADY_EXISTS;
             if already_exists {
                 let _ = CloseHandle(handle);
                 Ok(None)
