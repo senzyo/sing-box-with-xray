@@ -555,6 +555,18 @@ fn run_service_command(hwnd: isize, guard: state::FlagGuard, cmd: ServiceCommand
 }
 
 fn run_update_command(hwnd: isize, guard: state::FlagGuard, cmd: UpdateCommand) {
+    // 规则集更新也在往核心目录写文件, 而且同样是几十 MB 的下载。两件事不并行:
+    // 规则集是切换配置的副作用、已经在下载中, 中断它等于白下一遍; 让用户等十几
+    // 秒再点更新核心的代价小得多。
+    //
+    // 反方向不需要检查: 规则集更新只由 restart_all_at / restart_xray_at 触发,
+    // 而这两个只在占着忙标志的后台线程里跑, 本次更新期间用户点不到它们。
+    if process::ruleset_updating() {
+        info!("规则集更新进行中, 本次核心更新取消");
+        toast::show_toast("请稍后再试", "规则集正在更新, 完成后再更新核心");
+        return;
+    }
+
     let exe_dir = match state::exe_dir() {
         Ok(d) => d,
         Err(e) => {

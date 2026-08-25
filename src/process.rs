@@ -10,7 +10,7 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::ptr::null;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
@@ -207,6 +207,13 @@ fn kill_processes_by_name(exe_name: &str) {
 
 /// 规则集更新是否正在进行。
 static RULESET_UPDATING: AtomicBool = AtomicBool::new(false);
+
+/// 规则集更新是否正在进行。
+///
+/// 供更新核心前的互斥检查使用: 两者都是几十 MB 的下载, 不并行抢带宽。
+pub fn ruleset_updating() -> bool {
+    RULESET_UPDATING.load(Ordering::SeqCst)
+}
 
 /// 在独立线程中启动规则集更新, 立即返回。
 ///
@@ -612,6 +619,16 @@ mod tests {
         let hex_part = &name1[TUN_PREFIX.len()..];
         assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(name1, name2);
+    }
+
+    /// 更新核心前的互斥检查读的必须是规则集更新自己用的那个标志。
+    #[test]
+    fn test_ruleset_updating_reflects_flag() {
+        assert!(!ruleset_updating(), "初始应为空闲");
+        let guard = state::FlagGuard::acquire(&RULESET_UPDATING).expect("空闲时应能占用");
+        assert!(ruleset_updating(), "占用期间应报告进行中");
+        drop(guard);
+        assert!(!ruleset_updating(), "释放后应恢复空闲");
     }
 
     /// 写入配置并返回路径。
