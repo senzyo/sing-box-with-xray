@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -79,8 +79,11 @@ pub struct RulesetEntry {
 /// 规则集下载配置。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Ruleset {
+    /// 规则集条目。用 BTreeMap 而不是 HashMap: 保存配置时会把整个 Settings
+    /// 序列化回 settings.json, HashMap 的迭代顺序每次都不同, 会让文件产生
+    /// 无意义的 diff, 日志里的处理顺序也跟着乱。
     #[serde(flatten)]
-    pub entries: HashMap<String, RulesetEntry>,
+    pub entries: BTreeMap<String, RulesetEntry>,
     #[serde(default = "default_interval_days")]
     pub interval_days: u64,
 }
@@ -88,7 +91,7 @@ pub struct Ruleset {
 impl Default for Ruleset {
     fn default() -> Self {
         Ruleset {
-            entries: HashMap::new(),
+            entries: BTreeMap::new(),
             interval_days: default_interval_days(),
         }
     }
@@ -375,6 +378,25 @@ mod tests {
         assert_eq!(entry.dat, "https://example.com/geoip.dat");
         assert_eq!(entry.last_update, Some(1700000000));
         assert!(warnings.is_empty());
+    }
+
+    /// 规则集条目用 BTreeMap 存放, 序列化后键顺序稳定, 否则每次写回
+    /// settings.json 都会产生无意义的 diff。
+    #[test]
+    fn test_ruleset_serialization_order_is_stable() {
+        let json = r#"{
+            "download": {
+                "ruleset": {
+                    "zeta": { "dat": "z", "sha256sum": "z", "last_update": null },
+                    "alpha": { "dat": "a", "sha256sum": "a", "last_update": null }
+                }
+            }
+        }"#;
+        let (s, _) = parse_settings(json).unwrap();
+        let out = serde_json::to_string(&s).unwrap();
+        let alpha = out.find("alpha").expect("应含 alpha");
+        let zeta = out.find("zeta").expect("应含 zeta");
+        assert!(alpha < zeta, "键应按字典序输出: {out}");
     }
 
     #[test]
