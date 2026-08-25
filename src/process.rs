@@ -424,10 +424,7 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
                 .as_object()
                 .ok_or_else(|| AppError::Msg("xray.json 中 tun inbound 的 settings 不是对象".into()))?;
             let separator = if obj.is_empty() { "" } else { "," };
-            (
-                XRAY_SETTINGS_PATTERN,
-                format!("\"name\": \"{new_name}\"{separator}"),
-            )
+            (XRAY_SETTINGS_PATTERN, format!("\"name\": \"{new_name}\"{separator}"))
         }
     };
     let pos = text

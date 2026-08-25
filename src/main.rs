@@ -29,7 +29,6 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
 use tracing_subscriber::prelude::*;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND};
-use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Console::{
     CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, SetConsoleMode,
@@ -372,16 +371,12 @@ fn run() -> Result<(), AppError> {
     scheduler::ensure_boot_dns_reset_task(&exe_dir);
     toast::setup(&exe_path).map_err(|e| AppError::Msg(format!("初始化 Toast 通知失败: {e}")))?;
 
-    let icon_green = unsafe { tray::load_icon_bitmap(&exe_dir, "green_circle.ico") };
-    let icon_yellow = unsafe { tray::load_icon_bitmap(&exe_dir, "yellow_circle.ico") };
-    let icon_red = unsafe { tray::load_icon_bitmap(&exe_dir, "red_circle.ico") };
+    let icons = unsafe { tray::load_status_icons(&exe_dir) };
 
     state::APP
         .set(Mutex::new(state::AppState {
             exe_dir: exe_dir.clone(),
-            icon_green,
-            icon_yellow,
-            icon_red,
+            icons,
             settings: app_settings,
             child_sing_box: None,
             child_xray: None,
@@ -399,17 +394,7 @@ fn run() -> Result<(), AppError> {
     }
 
     if let Some(app) = state::app_state() {
-        unsafe {
-            if app.icon_green != 0 {
-                let _ = DeleteObject(HGDIOBJ(app.icon_green as *mut std::ffi::c_void));
-            }
-            if app.icon_yellow != 0 {
-                let _ = DeleteObject(HGDIOBJ(app.icon_yellow as *mut std::ffi::c_void));
-            }
-            if app.icon_red != 0 {
-                let _ = DeleteObject(HGDIOBJ(app.icon_red as *mut std::ffi::c_void));
-            }
-        }
+        app.icons.delete();
     }
 
     Ok(())

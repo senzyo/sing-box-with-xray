@@ -179,6 +179,17 @@ pub fn set_tooltip(text: &str) {
     }
 }
 
+/// 加载托盘菜单使用的三个状态图标。
+pub unsafe fn load_status_icons(exe_dir: &Path) -> state::StatusIcons {
+    unsafe {
+        state::StatusIcons {
+            running: load_icon_bitmap(exe_dir, "green_circle.ico"),
+            not_running: load_icon_bitmap(exe_dir, "yellow_circle.ico"),
+            not_installed: load_icon_bitmap(exe_dir, "red_circle.ico"),
+        }
+    }
+}
+
 /// 从 ICO 文件加载图标并转换为 32 位 DIB 位图句柄。
 ///
 /// 流程: LoadImageW 加载 ICO → 创建兼容 DC → 创建 DIB Section →
@@ -316,18 +327,12 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 /// 避免模态消息循环重入窗口过程时因 Mutex 不可重入导致死锁。
 unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
     unsafe {
-        let (exe_dir, icon_green, icon_yellow, icon_red, core_mode) = {
+        let (exe_dir, icons, core_mode) = {
             let app = match state::app_state() {
                 Some(app) => app,
                 None => return (0, HashMap::new()),
             };
-            (
-                app.exe_dir.clone(),
-                app.icon_green,
-                app.icon_yellow,
-                app.icon_red,
-                app.settings.core.mode,
-            )
+            (app.exe_dir.clone(), app.icons, app.settings.core.mode)
         };
 
         // 锁已释放才做状态查询: 进程快照和文件存在性检查都是几十毫秒级的
@@ -338,11 +343,6 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             return (0, HashMap::new());
         };
 
-        let status_hbmp = |s: ProcessState| match s {
-            ProcessState::Running => icon_green,
-            ProcessState::NotRunning => icon_yellow,
-            ProcessState::NotInstalled => icon_red,
-        };
         let status_label = |s: ProcessState, name: &str| match s {
             ProcessState::Running => format!("{name} 正在运行"),
             ProcessState::NotRunning => format!("{name} 未在运行"),
@@ -354,14 +354,14 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             append_status_item(
                 menu,
                 &status_label(states.sing_box, Core::SingBox.label()),
-                status_hbmp(states.sing_box),
+                icons.handle_for(states.sing_box),
             );
         }
         if core_mode.runs_xray() {
             append_status_item(
                 menu,
                 &status_label(states.xray, Core::Xray.label()),
-                status_hbmp(states.xray),
+                icons.handle_for(states.xray),
             );
         }
         append_separator(menu);

@@ -816,10 +816,7 @@ mod tests {
     fn test_backup_and_extract_rejects_path_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("core.zip");
-        write_test_zip(
-            &zip_path,
-            &[("../evil.txt", &b"pwned"[..]), ("good.txt", &b"ok"[..])],
-        );
+        write_test_zip(&zip_path, &[("../evil.txt", &b"pwned"[..]), ("good.txt", &b"ok"[..])]);
         let core_dir = dir.path().join("core");
 
         backup_and_extract(&zip_path, &core_dir, None).unwrap();

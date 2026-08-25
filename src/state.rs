@@ -18,6 +18,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 
 use crate::error::AppError;
 use crate::settings;
+use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
 
 /// 两个代理核心。
 ///
@@ -91,14 +92,45 @@ pub enum ProcessState {
     Running,
 }
 
+/// 三个状态图标的 GDI 位图句柄, 0 表示加载失败。
+#[derive(Clone, Copy, Default)]
+pub struct StatusIcons {
+    pub running: isize,
+    pub not_running: isize,
+    pub not_installed: isize,
+}
+
+impl StatusIcons {
+    /// 取进程状态对应的位图句柄。
+    pub fn handle_for(self, state: ProcessState) -> isize {
+        match state {
+            ProcessState::Running => self.running,
+            ProcessState::NotRunning => self.not_running,
+            ProcessState::NotInstalled => self.not_installed,
+        }
+    }
+
+    /// 释放三个位图句柄。
+    ///
+    /// 刻意做成显式方法而不是 `Drop`: `AppState` 放在 `OnceLock` 里, 静态变量
+    /// 的 Drop 永远不会执行, 写成 Drop 就成了不会运行的死代码。
+    pub fn delete(self) {
+        for handle in [self.running, self.not_running, self.not_installed] {
+            if handle != 0 {
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(handle as *mut std::ffi::c_void));
+                }
+            }
+        }
+    }
+}
+
 /// 全局应用状态。
 pub struct AppState {
     /// 可执行文件所在目录, 所有相对路径以此为基准。
     pub exe_dir: PathBuf,
-    /// GDI 位图句柄: 绿色 (运行中) 、黄色 (未运行) 、红色 (未安装) 。
-    pub icon_green: isize,
-    pub icon_yellow: isize,
-    pub icon_red: isize,
+    /// 托盘菜单里表示核心状态的图标。
+    pub icons: StatusIcons,
     pub settings: settings::Settings,
     /// 子进程句柄, 用于直接 kill。
     pub child_sing_box: Option<Child>,
