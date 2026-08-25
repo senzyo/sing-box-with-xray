@@ -214,21 +214,21 @@ where
         let color = level_color(level);
         let reset = if writer.has_ansi_escapes() { ANSI_RESET } else { "" };
         let lc = if writer.has_ansi_escapes() { color } else { "" };
-        let ts = format_utc_timestamp();
-        write!(&mut writer, "{ts} [{lc}{level}{reset}] ")?;
+        write_utc_timestamp(&mut writer)?;
+        write!(&mut writer, " [{lc}{level}{reset}] ")?;
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
 }
 
-fn format_utc_timestamp() -> String {
-    unsafe {
-        let t = GetSystemTime();
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
-        )
-    }
+/// 把当前 UTC 时间戳直接写进输出, 避免每条日志都分配一个 String。
+fn write_utc_timestamp(writer: &mut Writer<'_>) -> std::fmt::Result {
+    let t = unsafe { GetSystemTime() };
+    write!(
+        writer,
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+    )
 }
 
 /// 达到日志上限时写入的最后一条提示。

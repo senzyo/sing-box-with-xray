@@ -6,6 +6,7 @@
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,12 @@ use crate::error::AppError;
 
 /// GitHub API 要求的 User-Agent 头, 缺少会返回 403。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
+
+/// 计算哈希时的读取缓冲区大小。
+///
+/// 核心 zip 和规则集 dat 都在 10~30 MB 量级, 64 KB 相比 8 KB 能把 read 系统
+/// 调用次数降到八分之一。
+const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 // ureq 3 的所有超时默认都是 None (含 DNS 解析、建连和读取) , 不显式设置的话
 // 服务器接受连接后不发数据就会永久挂起, 下载线程永远不返回。
@@ -66,9 +73,8 @@ const XRAY_ZIP_NAME: &str = if cfg!(target_arch = "aarch64") {
 
 /// 依次更新 sing-box 和 xray。
 pub fn update_cores(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_secs: u64) -> Result<(), AppError> {
-    let exe_dir = exe_dir.to_path_buf();
-    update_sing_box(&exe_dir, gh_proxy_url, max_retries, delay_secs)?;
-    update_xray(&exe_dir, gh_proxy_url, max_retries, delay_secs)
+    update_sing_box(exe_dir, gh_proxy_url, max_retries, delay_secs)?;
+    update_xray(exe_dir, gh_proxy_url, max_retries, delay_secs)
 }
 
 /// 检查并更新 sing-box。
@@ -399,7 +405,7 @@ fn download_file(url: &str, dest: &Path) -> Result<(), AppError> {
 fn sha256_file(path: &Path) -> Result<String, AppError> {
     let mut file = fs::File::open(path).map_err(|e| AppError::Msg(format!("打开文件计算 SHA256 失败: {e}")))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
+    let mut buf = vec![0u8; HASH_BUFFER_SIZE];
     loop {
         let n = file
             .read(&mut buf)
@@ -409,7 +415,18 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
         }
         Digest::update(&mut hasher, &buf[..n]);
     }
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(to_hex(&hasher.finalize()))
+}
+
+/// 把字节序列编码成小写十六进制字符串。
+///
+/// 逐字节 `format!` 会为每个字节分配一个 String, 这里一次分配到位。
+fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// 备份核心目录并从 zip 解压全部内容。
@@ -721,16 +738,24 @@ mod tests {
         );
     }
 
+    /// 数据量刻意超过 HASH_BUFFER_SIZE, 覆盖多次 read 的累积路径。
     #[test]
     fn test_sha256_file_large_multichunk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("large.bin");
-        let data = vec![0xABu8; 20000];
+        let data = vec![0xABu8; 200_000];
+        assert!(data.len() > HASH_BUFFER_SIZE, "样本必须跨多个缓冲区");
         fs::write(&path, &data).unwrap();
         assert_eq!(
             sha256_file(&path).unwrap(),
-            "1b53c5e8138cf85261885e5efbd49452254ad6ad365603d05fc7776d5eee93c0"
+            "1bd168fa4e29a8a1af90173db63749b296c7f417c23487dd03ebf21d6ed663a6"
         );
+    }
+
+    #[test]
+    fn test_to_hex() {
+        assert_eq!(to_hex(&[]), "");
+        assert_eq!(to_hex(&[0x00, 0x0f, 0xff, 0xa5]), "000fffa5");
     }
 
     #[test]
