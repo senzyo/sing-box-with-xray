@@ -19,13 +19,14 @@ use error::AppError;
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::{Event, debug, error, info, warn};
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
 use tracing_subscriber::prelude::*;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
@@ -230,12 +231,75 @@ fn format_utc_timestamp() -> String {
     }
 }
 
+/// 达到日志上限时写入的最后一条提示。
+const LOG_LIMIT_NOTICE: &[u8] =
+    "\n[日志已达大小上限, 后续内容不再写入。可在 settings.json 的 log.max_size_mb 调整]\n".as_bytes();
+
+/// 带大小上限的日志文件。
+///
+/// 默认日志级别是 debug, 而子进程的 stderr 每一行都会被转发成 warn。核心进入
+/// 错误重试循环时会持续刷日志, 长期挂机可能写出很大的文件。达到上限后追加一
+/// 条提示, 之后静默丢弃。
+struct CappedFile {
+    file: std::fs::File,
+    written: u64,
+    /// 上限字节数, 0 表示不限制。
+    limit: u64,
+    notified: bool,
+}
+
+impl Write for CappedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.limit == 0 {
+            return self.file.write(buf);
+        }
+        if self.written >= self.limit {
+            if !self.notified {
+                self.notified = true;
+                let _ = self.file.write_all(LOG_LIMIT_NOTICE);
+                let _ = self.file.flush();
+            }
+            // 报告写入成功: 返回错误只会让 tracing 反复往 stderr 抱怨
+            return Ok(buf.len());
+        }
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// `CappedFile` 的共享句柄, 供 tracing 的 `MakeWriter` 使用。
+#[derive(Clone)]
+struct CappedLogWriter(Arc<Mutex<CappedFile>>);
+
+impl<'a> MakeWriter<'a> for CappedLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl Write for CappedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).flush()
+    }
+}
+
 /// 初始化日志系统。
 ///
 /// 1. 为 Windows 控制台启用 ANSI 转义码支持 (彩色输出)
-/// 2. 创建 console_layer (stderr) 和 file_layer (app.log)
+/// 2. 创建 console_layer (stderr) 和 file_layer (app.log, 带大小上限)
 /// 3. 日志级别优先使用 RUST_LOG 环境变量, 否则使用 settings.json 中的配置
-fn init_logging(exe_dir: &Path, log_level: &str) -> Result<(), AppError> {
+fn init_logging(exe_dir: &Path, log: &settings::Log) -> Result<(), AppError> {
     unsafe {
         if let Ok(handle) = GetStdHandle(STD_ERROR_HANDLE) {
             let mut mode = CONSOLE_MODE::default();
@@ -245,7 +309,7 @@ fn init_logging(exe_dir: &Path, log_level: &str) -> Result<(), AppError> {
         }
     }
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log.level));
 
     let console_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -255,12 +319,18 @@ fn init_logging(exe_dir: &Path, log_level: &str) -> Result<(), AppError> {
 
     let log_path = exe_dir.join("app.log");
     let file = std::fs::File::create(log_path).map_err(|e| AppError::Msg(format!("创建日志文件失败: {e}")))?;
+    let writer = CappedLogWriter(Arc::new(Mutex::new(CappedFile {
+        file,
+        written: 0,
+        limit: log.max_size_mb.saturating_mul(1024 * 1024),
+        notified: false,
+    })));
     let file_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(false)
         .compact()
         .event_format(BracketedLevel)
-        .with_writer(file);
+        .with_writer(writer);
 
     tracing_subscriber::registry()
         .with(file_layer)
@@ -290,7 +360,7 @@ fn run() -> Result<(), AppError> {
 
     let app_settings = settings::Settings::load(&exe_dir);
 
-    init_logging(&exe_dir, &app_settings.log.level)?;
+    init_logging(&exe_dir, &app_settings.log)?;
     // 尽早安装: 之后的任何 panic 都要走清理路径恢复 DNS
     install_panic_hook();
     for w in settings::Settings::take_warnings() {
@@ -590,4 +660,50 @@ fn run_config_switch(guard: state::FlagGuard, action: ConfigAction) {
             toast::show_toast("操作失败", &err.to_string());
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capped(path: &Path, limit: u64) -> CappedFile {
+        CappedFile {
+            file: std::fs::File::create(path).unwrap(),
+            written: 0,
+            limit,
+            notified: false,
+        }
+    }
+
+    #[test]
+    fn test_capped_file_stops_growing_at_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        let mut writer = capped(&path, 100);
+
+        for _ in 0..10 {
+            assert_eq!(writer.write(&[b'x'; 40]).unwrap(), 40, "超限后也应报告写入成功");
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        // 前三次写满 120 字节后追加一条提示, 之后不再增长
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(size, 120 + LOG_LIMIT_NOTICE.len() as u64);
+    }
+
+    #[test]
+    fn test_capped_file_zero_limit_is_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        let mut writer = capped(&path, 0);
+
+        for _ in 0..10 {
+            writer.write_all(&[b'x'; 40]).unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 400);
+    }
 }

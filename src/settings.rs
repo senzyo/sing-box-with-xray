@@ -63,6 +63,9 @@ pub struct Log {
     /// 日志级别, 可选值: "debug", "info", "warn", "error"。
     #[serde(default = "default_log_level")]
     pub level: String,
+    /// `app.log` 的大小上限 (MB) , 0 表示不限制。
+    #[serde(default = "default_log_max_size_mb")]
+    pub max_size_mb: u64,
 }
 
 /// 单个规则集配置。
@@ -124,6 +127,10 @@ fn default_log_level() -> String {
     "debug".to_string()
 }
 
+fn default_log_max_size_mb() -> u64 {
+    10
+}
+
 fn default_max_retries() -> u32 {
     3
 }
@@ -140,6 +147,7 @@ impl Default for Log {
     fn default() -> Self {
         Log {
             level: default_log_level(),
+            max_size_mb: default_log_max_size_mb(),
         }
     }
 }
@@ -163,6 +171,9 @@ const ALLOWED_LEVELS: &[&str] = &["debug", "info", "warn", "error"];
 ///
 /// 除了避免无意义的巨大间隔, 也防止 `interval_days * 86400` 溢出 u64。
 const MAX_INTERVAL_DAYS: u64 = 365;
+
+/// 日志文件大小上限的可配置上界 (MB) 。
+const MAX_LOG_SIZE_MB: u64 = 4096;
 
 impl Settings {
     /// 从 `exe_dir/settings.json` 加载配置。
@@ -244,6 +255,12 @@ impl Settings {
         if self.download.ruleset.interval_days > MAX_INTERVAL_DAYS {
             warnings.push(format!("interval_days 超出上限 {MAX_INTERVAL_DAYS}, 已自动限制"));
             self.download.ruleset.interval_days = MAX_INTERVAL_DAYS;
+        }
+
+        // max_size_mb 允许为 0, 语义是不限制日志大小。
+        if self.log.max_size_mb > MAX_LOG_SIZE_MB {
+            warnings.push(format!("log.max_size_mb 超出上限 {MAX_LOG_SIZE_MB}, 已自动限制"));
+            self.log.max_size_mb = MAX_LOG_SIZE_MB;
         }
 
         warnings
