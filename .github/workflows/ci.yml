@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 构建后发布 GitHub Release
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -41,6 +46,20 @@ jobs:
           if ($tag -ne $ver) {
             Write-Error "Tag version ($tag) does not match Cargo.toml version ($ver)"
             exit 1
+          }
+
+      - name: Verify tag is free
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          $refs = git ls-remote --tags origin "v$ver*"
+          if ($refs) {
+            $shas = @($refs | ForEach-Object { ($_ -split '\s+')[0] })
+            if ($shas -notcontains "${{ github.sha }}") {
+              Write-Error "Tag v$ver already points to another commit; bump version or delete the tag"
+              exit 1
+            }
           }
 
       - name: Format
@@ -93,11 +112,23 @@ jobs:
           Copy-Item target\aarch64-pc-windows-msvc\release\LICENSE $dir\
           Compress-Archive $dir "$dir.zip"
 
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifacts
+        if: github.event_name == 'workflow_dispatch' && !inputs.publish
+        uses: actions/upload-artifact@v7
         with:
+          name: ladder-v${{ steps.version.outputs.version }}
+          if-no-files-found: error
+          path: |
+            ladder-amd64-v${{ steps.version.outputs.version }}.zip
+            ladder-arm64-v${{ steps.version.outputs.version }}.zip
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
+          fail_on_unmatched_files: true
           files: |
             ladder-amd64-v${{ steps.version.outputs.version }}.zip
             ladder-arm64-v${{ steps.version.outputs.version }}.zip
